@@ -15,6 +15,11 @@ void psvr2_stop(void);
  * USB error (cable unplugged). */
 int psvr2_link_lost(void);
 
+/* 1 — starts keep failing because the headset sits behind a USB 2 hub, adapter
+ * or cable: it runs at full speed there, without the endpoint that carries the
+ * IMU. Only a USB 3 port helps; cleared when the device is unplugged. */
+int psvr2_full_speed_link(void);
+
 /* psvr2_stop() + psvr2_start(), for reconnecting after the link is lost;
  * a missing device is not logged. Like start/stop and the camera calls it
  * touches the device handle: call all of them from one serial queue (the

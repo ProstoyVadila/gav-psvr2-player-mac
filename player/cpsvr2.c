@@ -86,6 +86,16 @@ static int g_quiet_start;
  * be set up (seen after a cable replug) */
 static int g_claim_failures;
 static volatile int g_reset_in_flight;
+/* The headset has no high-speed mode: behind a USB 2 hub, adapter or cable it
+ * enumerates at full speed (12 Mbit/s) with a reduced descriptor set where the
+ * status interface has no alt setting 1 — no IMU, proximity sensor or Fn
+ * button, and SLAM-only tracking is too jerky to be worth running. A bad
+ * plug-in (USB 2 contacts mate first) looks the same and a re-enumeration
+ * cures it, so that is tried once per connection; after that the start just
+ * fails with this flag set and the UI tells the user to find a USB 3 port */
+static volatile int g_full_speed_link;
+static int g_speed_reset_done;
+static double g_reset_time;
 static int g_have_pose;
 static float g_quat[4];
 static float g_pos[3];
@@ -327,6 +337,7 @@ static void request_device_reset(void)
 		return;
 	}
 	g_reset_in_flight = 1;
+	g_reset_time = monotonic_s();
 	fprintf(stderr, "psvr2: requesting a device re-enumeration\n");
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, reset_thread_fn, NULL) == 0) {
@@ -384,6 +395,27 @@ int psvr2_get_distortion_calibration(float out[8])
 	return 0;
 }
 
+/* 1 — the status interface has alt setting 1 (the one with the endpoint) */
+static int status_alt_present(void)
+{
+	struct libusb_config_descriptor *cfg = NULL;
+	if (libusb_get_active_config_descriptor(libusb_get_device(g_dev), &cfg) != 0) {
+		return 1; /* can't tell — let the claim decide */
+	}
+	int present = 0;
+	for (int i = 0; i < cfg->bNumInterfaces; i++) {
+		const struct libusb_interface *itf = &cfg->interface[i];
+		for (int a = 0; a < itf->num_altsetting; a++) {
+			if (itf->altsetting[a].bInterfaceNumber == STATUS_INTERFACE &&
+			    itf->altsetting[a].bAlternateSetting == 1) {
+				present = 1;
+			}
+		}
+	}
+	libusb_free_config_descriptor(cfg);
+	return present;
+}
+
 int psvr2_start(void)
 {
 	if (g_running) {
@@ -408,8 +440,34 @@ int psvr2_start(void)
 		}
 		libusb_exit(g_ctx);
 		g_ctx = NULL;
+		/* Really unplugged (not the gap of our own re-enumeration): the next
+		 * connection gets its own reset attempt */
+		if (!g_reset_in_flight && monotonic_s() - g_reset_time > 5.0) {
+			g_speed_reset_done = 0;
+			g_full_speed_link = 0;
+		}
 		return -1;
 	}
+
+	if (!status_alt_present()) {
+		libusb_close(g_dev);
+		g_dev = NULL;
+		libusb_exit(g_ctx);
+		g_ctx = NULL;
+		if (!g_speed_reset_done) {
+			g_speed_reset_done = 1;
+			fprintf(stderr, "psvr2: the headset enumerated at full speed (no status endpoint) — "
+			                "trying a re-enumeration\n");
+			request_device_reset();
+		} else if (!g_reset_in_flight && !g_full_speed_link) {
+			g_full_speed_link = 1;
+			fprintf(stderr, "psvr2: !!! the headset is on a full-speed (12 Mbit/s) USB link: the hub, "
+			                "adapter or cable is USB 2 only. Tracking needs a USB 3 (5 Gbit/s) port\n");
+		}
+		return -1;
+	}
+	g_speed_reset_done = 0;
+	g_full_speed_link = 0;
 
 	int config = -1;
 	libusb_get_configuration(g_dev, &config);
@@ -476,6 +534,11 @@ void psvr2_stop(void)
 int psvr2_link_lost(void)
 {
 	return !g_running || g_link_lost;
+}
+
+int psvr2_full_speed_link(void)
+{
+	return g_full_speed_link;
 }
 
 int psvr2_restart(void)

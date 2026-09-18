@@ -1903,6 +1903,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var sweeper: WindowSweeper?
     var usbTimer: Timer?
     private var usbRestarting = false
+    // The "needs a USB 3 port" notice is up in the headset
+    private var usb2NoticeShown = false
     // File to open at launch: command-line argument, or a Finder/Dock open
     // that started the app
     private var videoURL: URL?
@@ -1935,7 +1937,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("[usb] Distortion calibration: \(calibration)")
             psvr2_set_brightness(HeadsetBrightness.value)
         } else {
-            print("[usb] !!! Headset not found on USB — rendering without tracking")
+            // A full-speed link gets its own message from checkUSBLink
+            print("[usb] !!! Headset not available on USB — rendering without tracking")
             calibration = [-0.09919293, 0, 0.09919293, 0, 1, 0, 1, 0]
         }
         Self.fixUpCalibration(&calibration)
@@ -2118,6 +2121,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // wasn't on USB at launch): retry until the device is back. The restart
     // blocks on USB calls, so it runs on the control queue, serialized with
     // the camera calls
+    // Behind a USB 2 hub or adapter the headset can't deliver tracking at all
+    // (see g_full_speed_link in cpsvr2.c) and no retry will change that: say
+    // so where the user looks, until the device is replugged elsewhere
+    private func updateUSB2Notice(connected: Bool) {
+        let usb2 = !connected && psvr2_full_speed_link() == 1
+        guard usb2 != usb2NoticeShown else { return }
+        usb2NoticeShown = usb2
+        if usb2 {
+            print("[usb] !!! the headset is behind a USB 2 hub/adapter — tracking needs a USB 3 (5 Gbit/s) port")
+            renderer.overlay?.showOSD("No head tracking: the headset is on a USB 2 hub or adapter — use a USB 3 port",
+                                      duration: 3600)
+        } else if connected {
+            renderer.overlay?.showOSD("Head tracking restored")
+        } else {
+            renderer.overlay?.showOSD("Head tracking lost — check the headset USB cable", duration: 3600)
+        }
+    }
+
     private func checkUSBLink() {
         guard !usbRestarting, psvr2_link_lost() == 1, let renderer else { return }
         usbRestarting = true
@@ -2136,6 +2157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.usbRestarting = false
+                self.updateUSB2Notice(connected: ok)
                 guard ok else { return }
                 print("[usb] PSVR2 reconnected, SLAM tracking restarted")
                 if haveCalibration {
