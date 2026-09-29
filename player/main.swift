@@ -6,7 +6,7 @@
 //
 // Keys: Space — pause, R — recenter, F — projection, G — stereo layout,
 // V — vertical flip, arrows — seek / volume, 9/0 — brightness,
-// +/- — fisheye FOV, Q — quit.
+// +/- — fisheye FOV or flat screen size, Q — quit.
 
 import AppKit
 import AVFoundation
@@ -48,11 +48,22 @@ struct Uniforms {
     float4 p4;       // x: has video, y: full-range YUV, z: BT.2020, w: BGRA frame
     float4 p5;       // x: passthrough on, y: camera FOV (rad), z: brightness, w: camera mode
     float4 p6;       // x: camera convergence, y: video stereo depth (fractions of frame)
+    float4 p7;       // flat screen: half-sizes in tan units (xy), eye disparity (z), background brightness (w)
 };
 
 constant float FX = 0.3585564;
 constant float FY = 0.3762281;
 constant float PI = 3.14159265358979;
+
+// Stereo layout: uv inside one eye's picture -> uv in the whole frame
+static float2 layout_uv(float2 uv, int stereo, int eye) {
+    if (stereo == 1) {
+        uv.x = uv.x * 0.5 + (eye == 1 ? 0.5 : 0.0);
+    } else if (stereo == 2) {
+        uv.y = uv.y * 0.5 + (eye == 1 ? 0.5 : 0.0);
+    }
+    return uv;
+}
 
 static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad, float shift, thread bool &valid) {
     float u, v;
@@ -85,12 +96,23 @@ static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad,
     if (shift != 0.0) {
         u = clamp(u + shift, 0.0, 1.0);
     }
-    if (stereo == 1) {
-        u = u * 0.5 + (eye == 1 ? 0.5 : 0.0);
-    } else if (stereo == 2) {
-        v = v * 0.5 + (eye == 1 ? 0.5 : 0.0);
+    return layout_uv(float2(u, v), stereo, eye);
+}
+
+// Flat screen (mode 3): a rectangle across the forward axis, p.xy are its
+// half-sizes in tan units. p.z is the per-eye disparity that puts it at a
+// finite distance (like the UI panel), otherwise the parallax of 3D movies
+// would diverge. Returns the uv inside one eye's picture
+static float2 flat_uv(float3 w, int eye, float4 p, thread bool &valid) {
+    valid = false;
+    if (w.z > -1e-3) {
+        return float2(0.0);
     }
-    return float2(u, v);
+    float sx = w.x / -w.z + (eye == 0 ? -p.z : p.z);
+    float sy = w.y / -w.z;
+    float2 uv = float2(sx / (2.0 * p.x) + 0.5, 0.5 - sy / (2.0 * p.y));
+    valid = all(uv >= 0.0) && all(uv <= 1.0);
+    return uv;
 }
 
 // Frames come in native YUV 4:2:0 (a third of the memory of BGRA: critical
@@ -115,6 +137,18 @@ static float3 yuv_to_rgb(float y, float2 cbcr, bool fullRange, bool bt2020) {
     return saturate(rgb);
 }
 
+// lod is the mip level of the luma plane; the 4:2:0 chroma plane is half
+// the size, so the same footprint is one level lower there
+static float3 sample_video(texture2d<float> texY, texture2d<float> texCbCr, sampler s,
+                           float2 uv, float lod, float4 p4) {
+    if (p4.w > 0.5) {
+        return texY.sample(s, uv, level(lod)).rgb;
+    }
+    float yv = texY.sample(s, uv, level(lod)).r;
+    float2 cc = texCbCr.sample(s, uv, level(max(lod - 1.0, 0.0))).rg;
+    return yuv_to_rgb(yv, cc, p4.y > 0.5, p4.z > 0.5);
+}
+
 fragment float4 fs_main(VSOut in [[stage_in]],
                         constant Uniforms &uni [[buffer(0)]],
                         device const packed_float3 *lut [[buffer(1)]],
@@ -122,12 +156,14 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                         texture2d<float> ui [[texture(1)]],
                         texture2d<float> videoCbCr [[texture(2)]],
                         texture2d<float> camL [[texture(3)]],
-                        texture2d<float> camR [[texture(4)]]) {
+                        texture2d<float> camR [[texture(4)]],
+                        texture2d<float> env [[texture(5)]]) {
     constexpr sampler smp(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    // Flat screen: the video comes as a mipmapped copy (see Renderer.mipmappedVideo)
+    constexpr sampler smpMip(mag_filter::linear, min_filter::linear, mip_filter::linear,
+                             address::clamp_to_edge);
 
     bool hasVideo = uni.p4.x > 0.5;
-    bool fullRange = uni.p4.y > 0.5;
-    bool bt2020 = uni.p4.z > 0.5;
 
     int mode = int(uni.p0.x);
     int stereo = int(uni.p0.y);
@@ -194,21 +230,43 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         // positive pushes the scene away, zero (default) leaves it untouched
         float depthShift = stereo == 0 ? 0.0 : (eye == 0 ? uni.p6.y : -uni.p6.y);
         bool valid;
-        float2 uv = project_dir(w, mode, stereo, eye, fovRad, depthShift, valid);
-        if (!valid) {
-            continue;
-        }
         float3 sampled;
-        if (hasVideo) {
-            if (uni.p4.w > 0.5) {
-                sampled = videoY.sample(smp, uv).rgb;
+        if (mode == 3) {
+            float2 suv = flat_uv(w, eye, uni.p7, valid);
+            suv.x += depthShift;
+            if (!valid || suv.x < 0.0 || suv.x > 1.0) {
+                // Around the screen: the dimmed environment panorama
+                sampled = float3(0.0);
+                if (uni.p7.w > 0.0 && valid == false) {
+                    bool envValid;
+                    float2 euv = project_dir(w, 0, 0, 0, 0.0, 0.0, envValid);
+                    sampled = env.sample(smp, euv).rgb * uni.p7.w;
+                }
+            } else if (hasVideo) {
+                // Minification: one output pixel spans ~0.000921 of local
+                // lens coordinates (1.84 over 2000 px), turned into tan units
+                // by the LUT scale and the calibration matrix
+                float pixTan = 0.000921 * scale[ch] * length(float2(k3, k4));
+                float2 eyeTex = float2(videoY.get_width(), videoY.get_height());
+                if (stereo == 1) {
+                    eyeTex.x *= 0.5;
+                } else if (stereo == 2) {
+                    eyeTex.y *= 0.5;
+                }
+                float2 texels = pixTan / (2.0 * uni.p7.xy) * eyeTex;
+                float lod = max(log2(max(texels.x, texels.y)), 0.0);
+                sampled = sample_video(videoY, videoCbCr, smpMip, layout_uv(suv, stereo, eye), lod, uni.p4);
             } else {
-                float yv = videoY.sample(smp, uv).r;
-                float2 cc = videoCbCr.sample(smp, uv).rg;
-                sampled = yuv_to_rgb(yv, cc, fullRange, bt2020);
+                sampled = float3(0.16);
             }
         } else {
-            sampled = float3(0.16); // background when no file is open
+            float2 uv = project_dir(w, mode, stereo, eye, fovRad, depthShift, valid);
+            if (!valid) {
+                continue;
+            }
+            sampled = hasVideo
+                ? sample_video(videoY, videoCbCr, smp, uv, 0.0, uni.p4)
+                : float3(0.16); // background when no file is open
         }
 
         if (chromatic) {
@@ -303,12 +361,14 @@ enum Projection: Int32, CaseIterable {
     case equirect360 = 0
     case equirect180 = 1
     case fisheye = 2
+    case flat = 3 // ordinary 2D/3D movie on a virtual screen
 
     var label: String {
         switch self {
         case .equirect360: return "equirect 360°"
         case .equirect180: return "half-equirect 180°"
         case .fisheye: return "fisheye"
+        case .flat: return "flat screen"
         }
     }
 
@@ -317,6 +377,7 @@ enum Projection: Int32, CaseIterable {
         case .equirect360: return "360°"
         case .equirect180: return "180°"
         case .fisheye: return "fisheye"
+        case .flat: return "Flat"
         }
     }
 }
@@ -366,15 +427,26 @@ struct PlaybackConfig: Equatable {
         var stereoFromName = false
 
         // Container metadata (ProjectionKind / ViewPackingKind format
-        // description extensions, MV-HEVC eye views) fills in what the file
-        // name left open. Returns true if the config changed
-        mutating func apply(projectionKind: String?, viewPacking: String?, multiview: Bool) -> Bool {
+        // description extensions, MV-HEVC eye views) and the frame size fill
+        // in what the file name left open. Returns true if the config changed
+        mutating func apply(projectionKind: String?, viewPacking: String?, multiview: Bool,
+                            width: Int, height: Int) -> Bool {
             let before = config
+            let aspect = height > 0 ? Double(width) / Double(height) : 2
             if !projectionFromName {
                 switch projectionKind {
                 case "Equirectangular": config.projection = .equirect360
                 case "HalfEquirectangular": config.projection = .equirect180
-                default: break // rectilinear / unknown: keep the guess
+                case "Rectilinear": config.projection = .flat // iPhone / Vision Pro spatial video
+                case nil:
+                    // VR frames are 2:1 (180° SBS, 360° mono), 1:1 (360° TB,
+                    // 180° mono) or rarely 1:2 / 4:1; anything else (16:9,
+                    // scope, 4:3, full-SBS 32:9) is an ordinary movie
+                    let vr = [0.5, 1, 2, 4].contains { abs(aspect / $0 - 1) < 0.03 }
+                    if !vr {
+                        config.projection = .flat
+                    }
+                default: break // unknown kind: keep the guess
                 }
             }
             if !stereoFromName {
@@ -387,10 +459,28 @@ struct PlaybackConfig: Equatable {
                     // An unpacked full sphere is mono as well
                     if multiview || projectionKind == "Equirectangular" {
                         config.stereo = .mono
+                    } else if config.projection == .flat {
+                        // Untagged movie: mono, unless the frame holds two
+                        // full-size 16:9…scope pictures side by side or stacked
+                        config.stereo = aspect > 3.2 ? .sbs : (aspect > 0.8 && aspect < 0.95 ? .tb : .mono)
                     }
                 }
             }
             return config != before
+        }
+    }
+
+    // Picture aspect of one eye on the flat screen. Half-SBS / half-TB
+    // squeeze each eye into half the frame and are shown stretched back:
+    // an eye narrower than 1.25:1 (half-SBS of 16:9 is 0.89, of scope 1.2)
+    // or wider than 3:1 (half-TB of 16:9 is 3.56) is taken as squeezed
+    static func flatAspect(width: Int, height: Int, stereo: StereoLayout) -> Float {
+        guard width > 0, height > 0 else { return 16.0 / 9.0 }
+        let frame = Float(width) / Float(height)
+        switch stereo {
+        case .mono: return frame
+        case .sbs: return frame / 2 < 1.25 ? frame : frame / 2
+        case .tb: return frame * 2 > 3 ? frame : frame * 2
         }
     }
 
@@ -430,7 +520,7 @@ struct PlaybackConfig: Equatable {
         }
 
         let hasToken = { (list: [String]) in list.contains(where: tokens.contains) }
-        if hasToken(["TB", "OU", "3DV"]) || n.contains("OVERUNDER") || n.contains("TOPBOTTOM") {
+        if hasToken(["TB", "OU", "3DV", "HTB", "HOU", "FTB", "FOU"]) || n.contains("OVERUNDER") || n.contains("TOPBOTTOM") {
             d.config.stereo = .tb
             d.stereoFromName = true
         } else if hasToken(["LR", "3DH"]) || n.contains("SBS") || n.contains("SIDEBYSIDE") {
@@ -609,7 +699,8 @@ struct Uniforms {
     var p3: SIMD4<Float> // panel: center and half-sizes in tan space
     var p4: SIMD4<Float> // has video, full-range YUV, BT.2020
     var p5: SIMD4<Float> // passthrough on, camera FOV (rad), brightness, camera mode
-    var p6: SIMD4<Float> // camera convergence
+    var p6: SIMD4<Float> // camera convergence, video stereo depth
+    var p7: SIMD4<Float> // flat screen: half-sizes in tan units, eye disparity, background brightness
 }
 
 // MARK: - Video
@@ -634,8 +725,8 @@ final class VideoSource {
     let url: URL
     var onUnsupported: ((String) -> Void)?
     // Format hints found in the track: ProjectionKind, ViewPackingKind,
-    // MV-HEVC stereo pair (called on main, only when there is any)
-    var onFormatMetadata: ((String?, String?, Bool) -> Void)?
+    // MV-HEVC stereo pair, frame width and height (called on main)
+    var onFormatMetadata: ((String?, String?, Bool, Int, Int) -> Void)?
     private var loggedFormat = false
     private var noFrameSince = CACurrentMediaTime()
     private var gotAnyFrame = false
@@ -741,6 +832,9 @@ final class VideoSource {
 
             var codec = "?"
             var extra = ""
+            var projectionKind: String?
+            var viewPacking: String?
+            var multiview = false
             if let desc = formats.first {
                 let sub = CMFormatDescriptionGetMediaSubType(desc)
                 codec = String(bytes: [
@@ -754,9 +848,9 @@ final class VideoSource {
                         extra += ", MV-HEVC"
                     }
                     // Literal keys: the constants need macOS 14/15
-                    let projectionKind = exts["ProjectionKind"] as? String
-                    let viewPacking = exts["ViewPackingKind"] as? String
-                    let multiview = exts["HasLeftStereoEyeView"] as? Bool == true
+                    projectionKind = exts["ProjectionKind"] as? String
+                    viewPacking = exts["ViewPackingKind"] as? String
+                    multiview = exts["HasLeftStereoEyeView"] as? Bool == true
                         && exts["HasRightStereoEyeView"] as? Bool == true
                     if let projectionKind {
                         extra += ", projection \(projectionKind)"
@@ -764,13 +858,12 @@ final class VideoSource {
                     if let viewPacking {
                         extra += ", packing \(viewPacking)"
                     }
-                    if projectionKind != nil || viewPacking != nil || multiview {
-                        await MainActor.run {
-                            self.onFormatMetadata?(projectionKind, viewPacking, multiview)
-                        }
-                    }
                 }
                 extra += ", layers: \(formats.count)"
+            }
+            await MainActor.run { [projectionKind, viewPacking, multiview] in
+                self.onFormatMetadata?(projectionKind, viewPacking, multiview,
+                                       Int(size.width), Int(size.height))
             }
 
             print("[video] Track: \(codec), \(Int(size.width))x\(Int(size.height)), "
@@ -1092,6 +1185,25 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
     // What the file name and container metadata suggest for the open file
     var detection = PlaybackConfig.Detection()
+    // Flat screen width as a view angle. A viewing preference rather than a
+    // property of the file, so it is global, not part of PlaybackConfig
+    var screenWidthDeg: Float = UserDefaults.standard.object(forKey: "screenSize") as? Float ?? 80 {
+        didSet {
+            screenWidthDeg = max(30, min(140, screenWidthDeg))
+            UserDefaults.standard.set(screenWidthDeg, forKey: "screenSize")
+        }
+    }
+    // The flat screen sits at ~3 m: per-eye disparity in tan units (half the
+    // IPD over the distance; the UI panel uses 0.021 for ~1.5 m). Nearer than
+    // a real cinema on purpose: 3D movies are mastered for TV-sized screens,
+    // and their background parallax would diverge on a far, huge one
+    static let screenDisparity: Float = 0.0105
+    // The panorama around the flat screen, dimmed like a cinema hall
+    static let screenSurround: Float = 0.3
+    // Mipmapped copy of the current frame for the flat screen (see mipmappedVideo)
+    private var mipY: MTLTexture?
+    private var mipCbCr: MTLTexture?
+    private weak var mipSource: MTLTexture?
     var calibration: [Float]
     var chromaticEnabled = true
     var scanlineEnabled = true
@@ -1301,6 +1413,61 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     // Stop: close the file (position is saved) and return to the file list
+    // Flat screen geometry for the shader (Uniforms.p7): half-sizes in tan
+    // units from the width angle and the eye picture aspect, disparity,
+    // surround brightness (0 — black while the panorama is not loaded yet)
+    private func flatScreenParams(_ flat: Bool) -> SIMD4<Float> {
+        guard flat else { return SIMD4(1, 1, 0, 0) }
+        let aspect = PlaybackConfig.flatAspect(
+            width: video?.textureY?.width ?? 0, height: video?.textureY?.height ?? 0,
+            stereo: config.stereo)
+        let halfW = tanf(screenWidthDeg * .pi / 360)
+        return SIMD4(halfW, halfW / aspect, Self.screenDisparity,
+                     envTexture != nil ? Self.screenSurround : 0)
+    }
+
+    // On the flat screen a 1080p…4K frame is squeezed into a few hundred to
+    // ~1500 panel pixels, and bilinear sampling of the decoder's texture
+    // shimmers. Each new frame is copied into a mipmapped texture (a blit
+    // before the render pass, same command buffer) and the shader picks the
+    // level from the pixel footprint. Returns nil until the first frame
+    private func mipmappedVideo(_ cmd: MTLCommandBuffer) -> (y: MTLTexture, cbcr: MTLTexture)? {
+        guard let v = video, let srcY = v.textureY, let srcCbCr = v.textureCbCr else { return nil }
+        func fitted(_ tex: MTLTexture?, like src: MTLTexture) -> MTLTexture? {
+            if let tex, tex.width == src.width, tex.height == src.height,
+               tex.pixelFormat == src.pixelFormat {
+                return tex
+            }
+            let d = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: true)
+            d.usage = [.shaderRead]
+            d.storageMode = .private
+            return device.makeTexture(descriptor: d)
+        }
+        // BGRA frames are a single texture bound to both slots
+        let bgra = srcY === srcCbCr
+        guard let dstY = fitted(mipY, like: srcY),
+              let dstCbCr = bgra ? dstY : fitted(mipCbCr, like: srcCbCr) else { return nil }
+        if dstY !== mipY || dstCbCr !== mipCbCr {
+            mipSource = nil // new textures: copy even if the frame is the same
+        }
+        mipY = dstY
+        mipCbCr = dstCbCr
+        if mipSource !== srcY, let blit = cmd.makeBlitCommandEncoder() {
+            mipSource = srcY
+            for (src, dst) in bgra ? [(srcY, dstY)] : [(srcY, dstY), (srcCbCr, dstCbCr)] {
+                blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: src.width, height: src.height, depth: 1),
+                          to: dst, destinationSlice: 0, destinationLevel: 0,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                blit.generateMipmaps(for: dst)
+            }
+            blit.endEncoding()
+        }
+        return (dstY, dstCbCr)
+    }
+
     func stopVideo() {
         guard let v = video else { return }
         v.savePosition()
@@ -1424,8 +1591,15 @@ final class Renderer: NSObject, MTKViewDelegate {
         // is sampled only after it
         guard let drawable = view.currentDrawable,
               let rpd = view.currentRenderPassDescriptor,
-              let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+              let cmd = queue.makeCommandBuffer() else { return }
+        let flat = video != nil && config.projection == .flat
+        let flatFrame = flat ? mipmappedVideo(cmd) : nil
+        if !flat {
+            mipY = nil
+            mipCbCr = nil
+            mipSource = nil
+        }
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
         let poseTime = CACurrentMediaTime()
         lastPoseTime = poseTime
@@ -1505,16 +1679,18 @@ final class Renderer: NSObject, MTKViewDelegate {
                 (passthrough?.fovDeg ?? 150) * .pi / 180,
                 passthrough?.brightness ?? 1.6,
                 Float(passthrough?.source.rawValue ?? 0)),
-            p6: SIMD4(passthrough?.convergence ?? 0, env != nil ? 0 : config.depth, 0, 0))
+            p6: SIMD4(passthrough?.convergence ?? 0, env != nil ? 0 : config.depth, 0, 0),
+            p7: flatScreenParams(flat))
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
         enc.setFragmentBuffer(lutBuffer, offset: 0, index: 1)
-        enc.setFragmentTexture(video?.textureY ?? env ?? placeholderY, index: 0)
+        enc.setFragmentTexture(flatFrame?.y ?? video?.textureY ?? env ?? placeholderY, index: 0)
         enc.setFragmentTexture(overlay?.texture ?? placeholderY, index: 1)
-        enc.setFragmentTexture(video?.textureCbCr ?? placeholderCbCr, index: 2)
+        enc.setFragmentTexture(flatFrame?.cbcr ?? video?.textureCbCr ?? placeholderCbCr, index: 2)
         enc.setFragmentTexture(passthrough?.textureL ?? placeholderY, index: 3)
         enc.setFragmentTexture(passthrough?.textureR ?? placeholderY, index: 4)
+        enc.setFragmentTexture(envTexture ?? placeholderY, index: 5)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         // Ground truth for the pose lookahead: when the frame really hit the
@@ -1705,6 +1881,12 @@ final class PlayerView: MTKView {
             pt.fovDeg = max(60, min(220, pt.fovDeg + delta))
             r.overlay?.showOSD("Camera FOV: \(Int(pt.fovDeg))°")
             print("[passthrough] camera FOV: \(Int(pt.fovDeg))°")
+            return
+        }
+        if r.video != nil, r.config.projection == .flat {
+            r.screenWidthDeg += delta
+            r.overlay?.showOSD("Screen \(Int(r.screenWidthDeg))°")
+            print("[player] screen size: \(Int(r.screenWidthDeg))°")
             return
         }
         r.config.fisheyeFovDeg += delta
@@ -2105,7 +2287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         print("[player] Controls: Space pause · R or headset Fn button — recenter · F projection · G stereo · V flip")
-        print("[player]           ←/→ ±15s · ↑/↓ volume · 9/0 brightness · +/- fisheye FOV · Q quit")
+        print("[player]           ←/→ ±15s · ↑/↓ volume · 9/0 brightness · +/- fisheye FOV / screen size · Q quit")
         print("[player]           debug: P prediction · [/] lookahead · T lookahead mode · S scanout · C chromatic")
     }
 
@@ -2176,7 +2358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let deskScreen = NSScreen.screens.first {
             !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
         } ?? NSScreen.main!
-        let size = NSSize(width: 620, height: 600)
+        let size = NSSize(width: 620, height: 624)
         let frame = NSRect(
             x: deskScreen.visibleFrame.maxX - size.width - 24,
             y: deskScreen.visibleFrame.minY + 24,
@@ -2241,6 +2423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addRow("Vertical flip", id: "flip", key: "V")
         addRow("Stereo depth", id: "depth", key: ", / .")
         addRow("Fisheye FOV", id: "fov", key: "+ / −")
+        addRow("Screen size (flat)", id: "screen", key: "+ / −")
         addHeader("Cameras (passthrough)")
         addRow("Mode", id: "pt", key: "B · double Fn")
         addRow("Stereo/mono", id: "ptmode", key: "M")
@@ -2327,6 +2510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set("flip", cfg.flipV < 0 ? "on" : "off")
         set("depth", cfg.depth == 0 ? "0 (default)" : String(format: "%+.3f", cfg.depth))
         set("fov", String(format: "%.0f°", cfg.fisheyeFovDeg))
+        set("screen", String(format: "%.0f° wide", r.screenWidthDeg))
 
         set("bright", "\(Int((HeadsetBrightness.value * 100).rounded()))%")
 
@@ -2460,15 +2644,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let remembered = FormatStore.config(for: url)
         renderer.config = remembered ?? renderer.detection.config
         // Track metadata arrives later and fills in what the name left open
-        vs.onFormatMetadata = { [weak renderer, weak vs] projectionKind, viewPacking, multiview in
+        vs.onFormatMetadata = { [weak renderer, weak vs] projectionKind, viewPacking, multiview, w, h in
             guard let renderer, let vs, renderer.video === vs else { return }
             let manual = renderer.config != renderer.detection.config
             guard renderer.detection.apply(
-                projectionKind: projectionKind, viewPacking: viewPacking, multiview: multiview),
+                projectionKind: projectionKind, viewPacking: viewPacking, multiview: multiview,
+                width: w, height: h),
                 !manual else { return }
             renderer.config = renderer.detection.config
-            print("[player] Format from track metadata: \(renderer.config.projection.label), "
-                + "\(renderer.config.stereo.label)")
+            print("[player] Format from track metadata / frame size: "
+                + "\(renderer.config.projection.label), \(renderer.config.stereo.label)")
         }
         renderer.playbackRate = 1.0 // rate is situational; a new file starts at 1×
 

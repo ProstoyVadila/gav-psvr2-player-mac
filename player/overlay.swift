@@ -230,7 +230,10 @@ final class UIOverlay {
             (String(format: "%g×", $0), .setSpeed($0), renderer?.playbackRate == $0)
         })
         addRow(3, label: { [weak self] in
-            "Fisheye \(Int(self?.renderer?.config.fisheyeFovDeg ?? 0))°"
+            guard let r = self?.renderer else { return "" }
+            return r.config.projection == .flat
+                ? "Screen \(Int(r.screenWidthDeg))°"
+                : "Fisheye \(Int(r.config.fisheyeFovDeg))°"
         }, options: [
             ("−", .fovDown, false),
             ("+", .fovUp, false),
@@ -675,11 +678,9 @@ final class UIOverlay {
             buildFormatButtons()
             redrawSoon()
         case .fovDown:
-            renderer?.config.fisheyeFovDeg -= 5
-            redrawSoon()
+            adjustSize(by: -5)
         case .fovUp:
-            renderer?.config.fisheyeFovDeg += 5
-            redrawSoon()
+            adjustSize(by: 5)
         case .cycleSpeed:
             let cur = renderer?.playbackRate ?? 1
             let idx = Self.speeds.firstIndex(of: cur) ?? 1
@@ -692,6 +693,17 @@ final class UIOverlay {
             redrawSoon()
         }
         return nil
+    }
+
+    // Format submenu −/+: the screen size on the flat screen, the lens FOV otherwise
+    private func adjustSize(by delta: Float) {
+        guard let r = renderer else { return }
+        if r.config.projection == .flat {
+            r.screenWidthDeg += delta
+        } else {
+            r.config.fisheyeFovDeg += delta
+        }
+        redrawSoon()
     }
 
     // LMB release: finish timeline dragging

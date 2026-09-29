@@ -28,10 +28,13 @@ brick) bridges that gap. No software can work around it.
 - Head tracking: the headset's on-board SLAM (~60 Hz) plus IMU integration
   (2000 Hz) with extrapolation — honest 120 fps with no ghosting
 - Per-scanline rolling-shutter compensation driven by the gyro
-- Projections: equirect 360°, half-equirect 180°, fisheye (adjustable FOV);
-  SBS / top-bottom / mono stereo; auto-detected from the file name (`_180`,
-  `_360`, `_SBS`/`_LR`/`_3DH`, `_TB`/`_OU`/`_3DV`, `_MONO`, `FISHEYE190`,
-  `MKX200`…) and track metadata; a format you pick by hand is remembered per file
+- Projections: equirect 360°, half-equirect 180°, fisheye (adjustable FOV),
+  and a flat virtual screen for ordinary 2D/3D movies (adjustable size,
+  half/full SBS and top-bottom); SBS / top-bottom / mono stereo;
+  auto-detected from the file name (`_180`, `_360`, `_SBS`/`_LR`/`_3DH`/`HSBS`,
+  `_TB`/`_OU`/`_3DV`/`HOU`, `_MONO`, `FISHEYE190`, `MKX200`…), track metadata
+  and the frame shape (VR frames are 2:1 or 1:1, anything else is a flat
+  movie); a format you pick by hand is remembered per file
 - Hardware video decoding (AVFoundation) — 8K HEVC is not a problem;
   playback speed 0.5–2× with pitch-corrected audio
 - Audio routes to the headset's headphones automatically. Recenter with the
@@ -42,7 +45,7 @@ brick) bridges that gap. No software can work around it.
 - File list with thumbnails, duration and resolution; the player remembers
   where you stopped in every file and resumes from there
 - A "Format" submenu for explicit projection / stereo layout / speed /
-  fisheye-FOV selection
+  fisheye-FOV or screen-size selection
 - Stop button closes the file and returns to the picker; when no file is
   open the picker stays on screen, floating in a black space environment
   with a nebula and stars (procedurally generated, pure-black background —
@@ -118,7 +121,7 @@ view) · `B` camera view (`M` stereo/mono, `,`/`.` convergence) ·
 `F` projection · `G` stereo · `V` vertical flip · `,`/`.` stereo depth (pushes
 an uncomfortably close scene away; separate from camera convergence) ·
 `←/→` ±15 s · `↑/↓` volume · `9`/`0` headset brightness ·
-`+/-` fisheye FOV or camera lens angle · `Q` quit.
+`+/-` fisheye FOV, flat screen size or camera lens angle · `Q` quit.
 Mouse: move — panel · click — select · right-drag — tilt scene ·
 wheel — scroll list. Trackpad: two-finger scroll — list, two-finger
 press-drag — tilt scene.
