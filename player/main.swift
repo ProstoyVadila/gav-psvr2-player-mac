@@ -2082,6 +2082,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Value fields in the remote's table, by row identifier
     var controlValues: [String: NSTextField] = [:]
     var statusTimer: Timer?
+    // MKV being remuxed before playback (one at a time)
+    var remuxer: Remuxer?
     var sweeper: WindowSweeper?
     var usbTimer: Timer?
     private var usbRestarting = false
@@ -2627,6 +2629,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func loadVideo(_ url: URL) {
         guard let renderer else { return }
+        // A new choice replaces an MKV still being prepared
+        if let r = remuxer {
+            r.cancel()
+            remuxer = nil
+            renderer.overlay?.clearOSD()
+        }
+        if Remuxer.handles(url) {
+            if let mp4 = Remuxer.existingRemux(for: url) {
+                print("[remux] \(url.lastPathComponent): playing its MP4 copy")
+                loadVideo(mp4)
+            } else {
+                remux(url)
+            }
+            return
+        }
         renderer.video?.stop()
         let vs = VideoSource(url: url, device: renderer.device)
         vs.onUnsupported = { [weak renderer] message in
@@ -2677,7 +2694,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + (remembered != nil ? " (remembered manual choice)" : ""))
     }
 
+    // MKV: remux into an MP4 next to it, then play that. Meanwhile the file
+    // list stays up (at the MKV's folder) with a progress toast; picking
+    // another file cancels
+    private func remux(_ url: URL) {
+        guard let renderer, let overlay = renderer.overlay else { return }
+        overlay.setCurrentFile(url)
+        if renderer.video != nil {
+            renderer.stopVideo() // opens the list itself
+        } else {
+            overlay.openPicker()
+        }
+        let r = Remuxer(source: url)
+        var shownPercent = -1
+        r.onProgress = { [weak overlay] fraction in
+            let percent = Int(fraction * 100)
+            guard percent != shownPercent else { return }
+            shownPercent = percent
+            overlay?.showOSD("Preparing MKV for playback… \(percent)%", duration: 3600)
+        }
+        r.onFinish = { [weak self, weak r] result in
+            guard let self, let r, self.remuxer === r else { return }
+            self.remuxer = nil
+            self.renderer?.overlay?.clearOSD()
+            switch result {
+            case .success(let mp4):
+                UserDefaults.standard.set(mp4.path, forKey: "lastFile")
+                self.loadVideo(mp4)
+            case .failure(let failure):
+                self.renderer?.overlay?.showOSD(failure.message, duration: 8)
+            }
+        }
+        remuxer = r
+        overlay.showOSD("Preparing MKV for playback…", duration: 3600)
+        print("[remux] \(url.lastPathComponent) → \(Remuxer.remuxURL(for: url).lastPathComponent)")
+        r.start()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        remuxer?.cancel(wait: true)
         renderer?.video?.savePosition()
         renderer?.overlay?.hide()
         if let link = cvLink {

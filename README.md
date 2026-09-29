@@ -6,9 +6,10 @@
 [![Donate](https://img.shields.io/badge/donate-DonationAlerts-ff6b35)](https://www.donationalerts.com/r/andreygav90)
 
 Native 180°/360° video player for a PlayStation VR2 connected to a Mac
-(Apple Silicon) through Sony's official PC adapter (CFI-ZAA1). No kexts, no
-Sony software: macOS sees the headset as a regular 4000×2040@120 display,
-and head pose is read over USB via libusb.
+(Apple Silicon) through Sony's official PC adapter (CFI-ZAA1) — ordinary
+2D and 3D movies play on a virtual screen too. No kexts, no Sony software:
+macOS sees the headset as a regular 4000×2040@120 display, and head pose is
+read over USB via libusb.
 
 Tested on: MacBook Air M4, macOS 15+, PSVR2 + PC adapter (DP cable + USB).
 
@@ -18,6 +19,14 @@ on USB). The headset's USB-C plug follows the VirtualLink spec — its own
 pin-out and 12 V power delivery, distinct from regular USB-C PD / DP Alt
 Mode — which a Thunderbolt port doesn't speak. The adapter (with its power
 brick) bridges that gap. No software can work around it.
+
+The adapter's USB cable needs a USB 3 port on the Mac (or a USB 3 hub). The
+headset has no USB 2 high-speed mode: behind a USB 2 hub, adapter or cable
+it falls back to 12 Mbit/s without the IMU stream, head tracking can't work,
+and the player says so in the headset. Blue connectors prove nothing — check
+`Link Speed` in `system_profiler SPUSBHostDataType`. Unplugging and
+replugging the USB cable while the player runs is fine: it reconnects by
+itself (the DisplayPort cable is another matter — restart the player).
 
 ## Features
 
@@ -37,6 +46,11 @@ brick) bridges that gap. No software can work around it.
   movie); a format you pick by hand is remembered per file
 - Hardware video decoding (AVFoundation) — 8K HEVC is not a problem;
   playback speed 0.5–2× with pitch-corrected audio
+- MP4 / MOV / M4V play directly. MKV (which macOS can't open) is remuxed on
+  first open into `<name>.mp4` next to it — video copied as is, DTS/TrueHD
+  and other unsupported audio converted to AAC, subtitles dropped — with a
+  progress readout in the headset; after that the MP4 is played and listed
+  instead. Needs `brew install ffmpeg`
 - Audio routes to the headset's headphones automatically. Recenter with the
   Fn button — the small button on the underside of the visor, bottom right
   when the headset is on your head
@@ -132,7 +146,8 @@ Debug: `P` pose prediction · `[`/`]` look-ahead bias · `T` measured/fixed look
 
 - `player/` — the player itself: `main.swift` (AppKit + Metal +
   AVFoundation + the shader), `overlay.swift` (in-headset panel and file
-  picker), `meta.swift` (thumbnail/metadata cache), `sweeper.swift` (moves
+  picker), `meta.swift` (thumbnail/metadata cache), `remux.swift` (MKV →
+  MP4 via ffmpeg), `sweeper.swift` (moves
   stray windows off the headset display), `passthrough.swift` (camera frames
   to BC4 textures), `cpsvr2.c` (SLAM/IMU/status/camera streams over libusb),
   `lut.c` (distortion table from Monado), `environment.jpg` (the space

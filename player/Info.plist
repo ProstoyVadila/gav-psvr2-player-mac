@@ -35,7 +35,33 @@
 			<key>LSItemContentTypes</key>
 			<array>
 				<string>public.movie</string>
+				<string>org.matroska.mkv</string>
 			</array>
+		</dict>
+	</array>
+
+	<!-- macOS itself doesn't know .mkv; imported (not exported) so an
+	     installed player that declares it takes precedence -->
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>org.matroska.mkv</string>
+			<key>UTTypeDescription</key>
+			<string>Matroska video</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.movie</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>mkv</string>
+				</array>
+				<key>public.mime-type</key>
+				<string>video/x-matroska</string>
+			</dict>
 		</dict>
 	</array>
 

@@ -82,7 +82,8 @@ final class UIOverlay {
     private var pickerEntries: [PickerEntry] = []
     private var pickerScroll = 0
     private let pickerRows = 6
-    private let videoExtensions: Set<String> = ["mp4", "m4v", "mov"]
+    // mkv is remuxed to an MP4 next to it on open (see Remuxer)
+    private let videoExtensions: Set<String> = ["mp4", "m4v", "mov", "mkv"]
 
     // Thumbnails and metadata of video files for the list
     private let metaCache = VideoMetaCache()
@@ -334,6 +335,12 @@ final class UIOverlay {
                 } else if exts.contains(url.pathExtension.lowercased()) {
                     files.append(PickerEntry(url: url, isDir: false, name: url.lastPathComponent))
                 }
+            }
+            // An MKV already remuxed is played through its MP4 next to it:
+            // list only that one
+            let paths = Set(files.map { $0.url.path })
+            files.removeAll {
+                Remuxer.handles($0.url) && paths.contains(Remuxer.remuxURL(for: $0.url).path)
             }
             let byName: (PickerEntry, PickerEntry) -> Bool = {
                 $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
