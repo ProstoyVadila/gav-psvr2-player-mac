@@ -21,9 +21,16 @@ open -a "$APP" --args --desktop "$@" || exit 1
 # the file on startup)
 tail -F "$LOG" 2>/dev/null &
 TAIL_PID=$!
-trap 'kill $TAIL_PID 2>/dev/null' EXIT INT TERM
+trap 'kill $TAIL_PID 2>/dev/null' EXIT
+
+# The app is not our child (launched via open), so Ctrl-C would only stop
+# this script. Forward it as SIGTERM: the app quits through
+# applicationWillTerminate and restores the displays and audio. Then wait
+# for it to finish restoring
+PROC="PSVR2Player.app/Contents/MacOS/psvr2player"
+trap 'echo "[desk] stopping the app…"; pkill -TERM -f "$PROC"' INT TERM
 
 sleep 1
-while pgrep -qf "PSVR2Player.app/Contents/MacOS/psvr2player"; do
+while pgrep -qf "$PROC"; do
 	sleep 1
 done

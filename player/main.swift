@@ -705,6 +705,90 @@ struct Uniforms {
 
 // MARK: - Video
 
+// MARK: - Headset audio
+
+// The headset's USB audio output, found via CoreAudio. The video player routes
+// its own AVPlayer there; desktop mode makes it the system output for all apps
+enum HeadsetAudio {
+    struct Device {
+        let id: AudioDeviceID
+        let uid: String
+        let name: String
+    }
+
+    private static func address(_ selector: AudioObjectPropertySelector,
+                                _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal)
+        -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private static func string(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
+        var addr = address(selector)
+        var value: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let err = withUnsafeMutablePointer(to: &value) { ptr -> OSStatus in
+            AudioObjectGetPropertyData(id, &addr, 0, nil, &size, ptr)
+        }
+        return err == noErr ? value as String : nil
+    }
+
+    // The "PS VR2" device that has output streams
+    static func findOutputDevice() -> Device? {
+        var addr = address(kAudioHardwarePropertyDevices)
+        var size: UInt32 = 0
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr else { return nil }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return nil }
+
+        for id in ids {
+            guard let name = string(id, kAudioObjectPropertyName),
+                  name.contains("PS VR2") || name.contains("PSVR2") else { continue }
+            // The headset exposes more than one device under this name,
+            // including its input-only mic. Routing AVPlayer's output to
+            // a device with no output streams silently breaks audio
+            // rendering — which stalls playback entirely, since
+            // AVPlayer's clock is normally driven by the audio output
+            var streamAddr = address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput)
+            var streamSize: UInt32 = 0
+            let hasOutput = AudioObjectGetPropertyDataSize(id, &streamAddr, 0, nil, &streamSize) == noErr
+                && streamSize > 0
+            guard hasOutput else {
+                print("[audio] skipping input-only device: \(name)")
+                continue
+            }
+            guard let uid = string(id, kAudioDevicePropertyDeviceUID) else { continue }
+            return Device(id: id, uid: uid, name: name)
+        }
+        return nil
+    }
+
+    // System default output (what apps play through) and the device for
+    // alerts and UI sounds
+    static let defaultOutput = kAudioHardwarePropertyDefaultOutputDevice
+    static let systemOutput = kAudioHardwarePropertyDefaultSystemOutputDevice
+
+    static func defaultDevice(_ selector: AudioObjectPropertySelector) -> AudioDeviceID? {
+        var addr = address(selector)
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let err = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return err == noErr && id != 0 ? id : nil
+    }
+
+    @discardableResult
+    static func setDefaultDevice(_ selector: AudioObjectPropertySelector, _ id: AudioDeviceID) -> Bool {
+        var addr = address(selector)
+        var value = id
+        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                                          UInt32(MemoryLayout<AudioDeviceID>.size), &value) == noErr
+    }
+
+    static func name(of id: AudioDeviceID) -> String {
+        string(id, kAudioObjectPropertyName) ?? "device \(id)"
+    }
+}
+
 final class VideoSource {
     let player: AVPlayer
     private var output: AVPlayerItemVideoOutput
@@ -909,63 +993,10 @@ final class VideoSource {
     }
 
     func routeAudioToHeadset() {
-        // Find the "PS VR2" audio output via CoreAudio and route sound there
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr else { return }
-        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
-        var ids = [AudioDeviceID](repeating: 0, count: count)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr else { return }
-
-        for id in ids {
-            var nameAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioObjectPropertyName,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            var name: CFString = "" as CFString
-            var nameSize = UInt32(MemoryLayout<CFString>.size)
-            let err = withUnsafeMutablePointer(to: &name) { ptr -> OSStatus in
-                AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &nameSize, ptr)
-            }
-            guard err == noErr else { continue }
-            if (name as String).contains("PS VR2") || (name as String).contains("PSVR2") {
-                // The headset exposes more than one device under this name,
-                // including its input-only mic. Routing AVPlayer's output to
-                // a device with no output streams silently breaks audio
-                // rendering — which stalls playback entirely, since
-                // AVPlayer's clock is normally driven by the audio output
-                var streamAddr = AudioObjectPropertyAddress(
-                    mSelector: kAudioDevicePropertyStreams,
-                    mScope: kAudioObjectPropertyScopeOutput,
-                    mElement: kAudioObjectPropertyElementMain)
-                var streamSize: UInt32 = 0
-                let hasOutput = AudioObjectGetPropertyDataSize(id, &streamAddr, 0, nil, &streamSize) == noErr
-                    && streamSize > 0
-                guard hasOutput else {
-                    print("[audio] skipping input-only device: \(name)")
-                    continue
-                }
-
-                var uidAddr = AudioObjectPropertyAddress(
-                    mSelector: kAudioDevicePropertyDeviceUID,
-                    mScope: kAudioObjectPropertyScopeGlobal,
-                    mElement: kAudioObjectPropertyElementMain)
-                var uid: CFString = "" as CFString
-                var uidSize = UInt32(MemoryLayout<CFString>.size)
-                let uidErr = withUnsafeMutablePointer(to: &uid) { ptr -> OSStatus in
-                    AudioObjectGetPropertyData(id, &uidAddr, 0, nil, &uidSize, ptr)
-                }
-                if uidErr == noErr {
-                    player.audioOutputDeviceUniqueID = uid as String
-                    audioDeviceID = id
-                    print("[audio] Audio routed to headset: \(name)")
-                }
-                return
-            }
-        }
+        guard let device = HeadsetAudio.findOutputDevice() else { return }
+        player.audioOutputDeviceUniqueID = device.uid
+        audioDeviceID = device.id
+        print("[audio] Audio routed to headset: \(device.name)")
     }
 
     // The device's "virtual" system volume ('vmvc') — controlled by the slider
@@ -1178,10 +1209,6 @@ final class Renderer: NSObject, MTKViewDelegate {
     // Desktop mode (--desktop): a captured macOS display on a flat panel
     // instead of a video. Set once at launch; nil in the video player
     var desktop: DesktopMode?
-    // Desktop panel: width as a view angle and per-eye disparity for ~1.5 m
-    // (same as the UI panel)
-    static let desktopWidthDeg: Float = 90
-    static let desktopDisparity: Float = 0.021
     // Every change made while a file is open (keys, Format menu) is a manual
     // choice: remembered per file unless it matches the automatic guess
     var config: PlaybackConfig {
@@ -1429,8 +1456,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             // Black around the panel (OLED); aspect of the captured display
             let size = ScreenCapture.pixelSize(of: desktop.capture.displayID)
             let aspect = size.height > 0 ? Float(size.width) / Float(size.height) : 16 / 9
-            let halfW = tanf(Self.desktopWidthDeg * .pi / 360)
-            return SIMD4(halfW, halfW / aspect, Self.desktopDisparity, 0)
+            let halfW = tanf(desktop.panelWidthDeg * .pi / 360)
+            return SIMD4(halfW, halfW / aspect, desktop.panelDisparity, 0)
         }
         let aspect = PlaybackConfig.flatAspect(
             width: video?.textureY?.width ?? 0, height: video?.textureY?.height ?? 0,
@@ -2121,6 +2148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var videoURL: URL?
     // --desktop: show a macOS display in the headset instead of a video
     private let desktopMode: Bool
+    private var signalSources: [DispatchSourceSignal] = []
 
     init(videoURL: URL?, desktopMode: Bool) {
         self.videoURL = videoURL
@@ -2203,9 +2231,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if desktopMode {
-            let desktop = DesktopMode(device: device, queue: renderer.queue)
+            let headsetID = vrScreen.map {
+                CGDirectDisplayID(truncating: $0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber)
+            }
+            let desktop = DesktopMode(device: device, queue: renderer.queue, headsetID: headsetID)
             desktop.capture.onFailure = { [weak overlay] message in
                 overlay?.showOSD(message, duration: 3600)
+            }
+            desktop.onNotice = { [weak overlay] message, duration in
+                overlay?.showOSD(message, duration: duration)
+            }
+            // The headset display moved in the arrangement: its window must follow
+            desktop.onArranged = { [weak self] in
+                self?.fitHeadsetWindow()
+            }
+            // pkill / Ctrl-C: quit through applicationWillTerminate so the
+            // display layout is restored (crashes are covered by .forAppOnly)
+            for sig in [SIGTERM, SIGINT] {
+                signal(sig, SIG_IGN)
+                let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+                source.setEventHandler {
+                    print("[desktop] signal \(sig) — quitting")
+                    NSApp.terminate(nil)
+                }
+                source.resume()
+                signalSources.append(source)
             }
             renderer.desktop = desktop
             desktop.start()
@@ -2296,17 +2346,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if Self.findVRScreen() != nil {
                     self.renderer.overlay?.showOSD(
                         "PS VR2 detected — restart the player to use the headset", duration: 3600)
-                } else if Self.vrDisplayIsMirrored() {
+                } else if Self.vrDisplayIsMirrored() && !self.desktopMode {
                     self.renderer.overlay?.showOSD(
                         "PS VR2 mirrors the monitor — set it to \u{201C}Extended display\u{201D} in Displays settings",
                         duration: 3600)
                 }
             }
+            if self.desktopMode {
+                self.fitHeadsetWindow()
+            }
             guard let mode = CGDisplayCopyDisplayMode(self.headsetDisplayID) else { return }
             self.renderer.setPanelRate(hz: mode.refreshRate)
         }
         if vrScreen != nil {
-            startWindowSweeper(vrScreen: screen)
+            // Desktop mode runs its own sweeper (several hidden displays,
+            // the virtual display as the target)
+            if !desktopMode {
+                startWindowSweeper(vrScreen: screen)
+            }
             // USB link watchdog: cable unplugged mid-run, or plugged in only
             // after launch
             usbTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -2341,6 +2398,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if desktopMode {
             print("[desktop] Controls: headset Fn button — recenter (long press: include pitch) · "
                 + "\(DesktopHotKey.emergencyQuit.label) — quit")
+            print("[desktop]           \(DesktopHotKey.narrower.label)/\(DesktopHotKey.wider.label) panel size · "
+                + "\(DesktopHotKey.nearer.label)/\(DesktopHotKey.farther.label) distance · "
+                + "\(DesktopHotKey.resetPanel.label) reset · \(DesktopHotKey.cycleMode.label) next display mode")
             return
         }
 
@@ -2591,6 +2651,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set("chrom", r.chromaticEnabled ? "on" : "off")
         set("vsync", ((playerView?.layer as? CAMetalLayer)?.displaySyncEnabled ?? true)
             ? "on" : "off")
+    }
+
+    // Desktop mode moves the headset display around in the arrangement; the
+    // borderless window has to cover it again
+    private func fitHeadsetWindow() {
+        guard !runningInPreview, let screen = Self.findVRScreen(), window.frame != screen.frame else { return }
+        window.setFrame(screen.frame, display: true)
+        print("[display] headset window moved to \(screen.frame)")
     }
 
     // Watchdog: foreign windows that land on the headset display are moved to the monitor

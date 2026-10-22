@@ -14,7 +14,7 @@ ifeq ($(strip $(SIGN_ID)),)
 SIGN_ID = -
 endif
 SWIFT_SRC = main.swift overlay.swift sweeper.swift meta.swift passthrough.swift remux.swift \
-	screen_capture.swift desktop.swift
+	screen_capture.swift desktop.swift virtual_display.swift
 
 all: $(APP)
 
@@ -24,8 +24,8 @@ cpsvr2.o: cpsvr2.c cpsvr2.h
 lut.o: lut.c
 	clang -O2 -c lut.c -o lut.o
 
-psvr2player: $(SWIFT_SRC) cpsvr2.o lut.o cpsvr2.h
-	swiftc -O -import-objc-header cpsvr2.h $(SWIFT_SRC) cpsvr2.o lut.o \
+psvr2player: $(SWIFT_SRC) cpsvr2.o lut.o cpsvr2.h bridging.h cgvirtualdisplay.h
+	swiftc -O -import-objc-header bridging.h $(SWIFT_SRC) cpsvr2.o lut.o \
 		$(LIBUSB_LDFLAGS) \
 		-framework AppKit -framework Metal -framework MetalKit \
 		-framework AVFoundation -framework CoreAudio -framework CoreVideo \
