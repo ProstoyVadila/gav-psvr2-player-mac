@@ -1175,6 +1175,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var envTexture: MTLTexture?
     let tracker = HeadTracker()
     var video: VideoSource?
+    // Desktop mode (--desktop): a captured macOS display on a flat panel
+    // instead of a video. Set once at launch; nil in the video player
+    var desktop: DesktopMode?
+    // Desktop panel: width as a view angle and per-eye disparity for ~1.5 m
+    // (same as the UI panel)
+    static let desktopWidthDeg: Float = 90
+    static let desktopDisparity: Float = 0.021
     // Every change made while a file is open (keys, Format menu) is a manual
     // choice: remembered per file unless it matches the automatic guess
     var config: PlaybackConfig {
@@ -1418,6 +1425,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     // surround brightness (0 — black while the panorama is not loaded yet)
     private func flatScreenParams(_ flat: Bool) -> SIMD4<Float> {
         guard flat else { return SIMD4(1, 1, 0, 0) }
+        if let desktop {
+            // Black around the panel (OLED); aspect of the captured display
+            let size = ScreenCapture.pixelSize(of: desktop.capture.displayID)
+            let aspect = size.height > 0 ? Float(size.width) / Float(size.height) : 16 / 9
+            let halfW = tanf(Self.desktopWidthDeg * .pi / 360)
+            return SIMD4(halfW, halfW / aspect, Self.desktopDisparity, 0)
+        }
         let aspect = PlaybackConfig.flatAspect(
             width: video?.textureY?.width ?? 0, height: video?.textureY?.height ?? 0,
             stereo: config.stereo)
@@ -1592,9 +1606,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         guard let drawable = view.currentDrawable,
               let rpd = view.currentRenderPassDescriptor,
               let cmd = queue.makeCommandBuffer() else { return }
-        let flat = video != nil && config.projection == .flat
-        let flatFrame = flat ? mipmappedVideo(cmd) : nil
-        if !flat {
+        // The desktop capture already arrives mipmapped (see ScreenCapture)
+        let deskTex = desktop?.capture.latestTexture
+        let flat = desktop != nil || (video != nil && config.projection == .flat)
+        let flatFrame = flat && desktop == nil ? mipmappedVideo(cmd) : nil
+        if !flat || desktop != nil {
             mipY = nil
             mipCbCr = nil
             mipSource = nil
@@ -1648,7 +1664,9 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         // With no file open, show the environment panorama: it goes through
         // the shader's video path as a 360° mono BGRA "video"
-        let env = video == nil ? envTexture : nil
+        let env = video == nil && desktop == nil ? envTexture : nil
+        let projection: Projection = desktop != nil ? .flat : (env != nil ? .equirect360 : config.projection)
+        let stereo: StereoLayout = desktop != nil || env != nil ? .mono : config.stereo
 
         var uni = Uniforms(
             rot: rot,
@@ -1656,10 +1674,10 @@ final class Renderer: NSObject, MTKViewDelegate {
             calibL: SIMD4(calibration[0], calibration[1], calibration[4], calibration[5]),
             calibR: SIMD4(calibration[2], calibration[3], calibration[6], calibration[7]),
             p0: SIMD4(
-                Float((env != nil ? .equirect360 : config.projection).rawValue),
-                Float((env != nil ? .mono : config.stereo).rawValue),
+                Float(projection.rawValue),
+                Float(stereo.rawValue),
                 config.fisheyeFovDeg * .pi / 180,
-                env != nil ? 1 : config.flipV),
+                env != nil || desktop != nil ? 1 : config.flipV),
             p1: SIMD4(gyroW.x, gyroW.y, gyroW.z, scanoutDuration),
             p2: SIMD4(
                 chromaticEnabled ? 1 : 0,
@@ -1670,24 +1688,24 @@ final class Renderer: NSObject, MTKViewDelegate {
                 Float((overlay?.active ?? false) ? overlay!.cursorV : -10)),
             p3: SIMD4(panelCenter.x, panelCenter.y, panelHalf.x, panelHalf.y),
             p4: SIMD4(
-                video?.textureY != nil || env != nil ? 1 : 0,
+                video?.textureY != nil || env != nil || deskTex != nil ? 1 : 0,
                 (video?.fullRange ?? false) ? 1 : 0,
                 (video?.bt2020 ?? false) ? 1 : 0,
-                video?.isBGRA ?? false || env != nil ? 1 : 0),
+                video?.isBGRA ?? false || env != nil || desktop != nil ? 1 : 0),
             p5: SIMD4(
                 (passthrough?.gotFrame ?? false) ? 1 : 0,
                 (passthrough?.fovDeg ?? 150) * .pi / 180,
                 passthrough?.brightness ?? 1.6,
                 Float(passthrough?.source.rawValue ?? 0)),
-            p6: SIMD4(passthrough?.convergence ?? 0, env != nil ? 0 : config.depth, 0, 0),
+            p6: SIMD4(passthrough?.convergence ?? 0, env != nil || desktop != nil ? 0 : config.depth, 0, 0),
             p7: flatScreenParams(flat))
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
         enc.setFragmentBuffer(lutBuffer, offset: 0, index: 1)
-        enc.setFragmentTexture(flatFrame?.y ?? video?.textureY ?? env ?? placeholderY, index: 0)
+        enc.setFragmentTexture(deskTex ?? flatFrame?.y ?? video?.textureY ?? env ?? placeholderY, index: 0)
         enc.setFragmentTexture(overlay?.texture ?? placeholderY, index: 1)
-        enc.setFragmentTexture(flatFrame?.cbcr ?? video?.textureCbCr ?? placeholderCbCr, index: 2)
+        enc.setFragmentTexture(deskTex ?? flatFrame?.cbcr ?? video?.textureCbCr ?? placeholderCbCr, index: 2)
         enc.setFragmentTexture(passthrough?.textureL ?? placeholderY, index: 3)
         enc.setFragmentTexture(passthrough?.textureR ?? placeholderY, index: 4)
         enc.setFragmentTexture(envTexture ?? placeholderY, index: 5)
@@ -1742,14 +1760,18 @@ final class Renderer: NSObject, MTKViewDelegate {
             // between frames; lat: pose sample -> scanout start avg (min..max);
             // out: presented time minus the display link's output time;
             // look: pose lookahead used (to mid-scanout, so ≈ lat + scanout/2);
-            // miss: vsyncs without a new frame (visible judder)
+            // miss: vsyncs without a new frame (visible judder);
+            // cap (desktop mode): complete capture frames per second
+            let cap = desktop.map {
+                String(format: " cap=%.1f", Double($0.capture.takeFrameCount()) / (now - statLastReport))
+            } ?? ""
             print(String(format: "[stat] fps=%.1f gpu=%.2fms cpu=%.2f/%.1fms gap=%.1fms "
                 + "lat=%.1f(%.1f..%.1f)ms out=%+.1fms look=%.1fms miss=%d mem=%.0fMB",
                 fps, statGpuTime / n * 1000, statCpuTime / n * 1000, statCpuMax * 1000,
                 statGapMax * 1000, statLatSum / lat * 1000,
                 (statLatCount > 0 ? statLatMin : 0) * 1000, statLatMax * 1000,
                 statOutErrSum / lat * 1000, statLookaheadSum / n * 1000,
-                statMissed, Self.memoryFootprintMB()))
+                statMissed, Self.memoryFootprintMB()) + cap)
             statLookaheadSum = 0
             statMissed = 0
             statFrames = 0
@@ -1791,6 +1813,11 @@ final class PlayerView: MTKView {
 
     override func keyDown(with event: NSEvent) {
         guard let r = renderer else { return }
+        // Desktop mode: keys only reach us while the preview window is focused;
+        // the video controls make no sense there
+        if r.desktop != nil && ![12, 53, 15].contains(event.keyCode) {
+            return
+        }
         switch event.keyCode {
         case 12, 53: // Q, Esc
             print("[player] quit")
@@ -2092,14 +2119,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // File to open at launch: command-line argument, or a Finder/Dock open
     // that started the app
     private var videoURL: URL?
+    // --desktop: show a macOS display in the headset instead of a video
+    private let desktopMode: Bool
 
-    init(videoURL: URL?) {
+    init(videoURL: URL?, desktopMode: Bool) {
         self.videoURL = videoURL
+        self.desktopMode = desktopMode
     }
 
     // "Open With", a drop on the Dock icon, `open -a PSVR2Player file`
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard let url = urls.first else { return }
+        guard !desktopMode, let url = urls.first else { return }
         guard let renderer else {
             // Still launching: applicationDidFinishLaunching picks it up
             videoURL = url
@@ -2147,7 +2177,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Control panel inside the headset (appears on mouse movement)
         let overlay = UIOverlay(device: device)
         overlay.renderer = renderer
-        overlay.captureEnabled = vrScreen != nil
+        // Desktop mode: the mouse belongs to the captured display, the panel
+        // only shows OSD toasts (the settings panel comes later)
+        overlay.desktopMode = desktopMode
+        overlay.captureEnabled = vrScreen != nil && !desktopMode
         let primaryHeight = NSScreen.screens[0].frame.height
         overlay.warpPoint = CGPoint(x: screen.frame.midX, y: primaryHeight - screen.frame.midY)
         overlay.onOpenFile = { [weak self] url in
@@ -2169,7 +2202,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 duration: 3600)
         }
 
-        if let url = videoURL {
+        if desktopMode {
+            let desktop = DesktopMode(device: device, queue: renderer.queue)
+            desktop.capture.onFailure = { [weak overlay] message in
+                overlay?.showOSD(message, duration: 3600)
+            }
+            renderer.desktop = desktop
+            desktop.start()
+        } else if let url = videoURL {
             loadVideo(url)
         }
 
@@ -2194,28 +2234,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.setFrame(screen.frame, display: true)
             window.contentView = view
             window.orderFrontRegardless()
-            makeControlWindow()
+            // Desktop mode has no remote: the captured display itself is
+            // where the user works. Clicks must never land on the headset
+            // window (they would activate the player over the user's app)
+            if desktopMode {
+                window.ignoresMouseEvents = true
+            } else {
+                makeControlWindow()
+            }
         } else {
             let rect = NSRect(x: 100, y: 100, width: 1000, height: 510)
             window = NSWindow(
                 contentRect: rect, styleMask: [.titled, .closable, .resizable],
                 backing: .buffered, defer: false)
-            window.title = "PSVR2 Player (preview)"
+            window.title = desktopMode ? "PSVR2 Desktop (preview)" : "PSVR2 Player (preview)"
             window.contentView = view
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(view)
         }
-        NSApp.activate(ignoringOtherApps: true)
+        // Desktop mode in the headset: the keyboard belongs to the user's apps
+        // (typing blind into the player would swallow keys — Q even quits),
+        // so stay in the background and leave keys alone; only the global
+        // hotkeys in desktop.swift reach the player
+        if !(desktopMode && vrScreen != nil) {
+            NSApp.activate(ignoringOtherApps: true)
+        }
 
         // Safety net: catch keys at the application level even if the window
         // on the headset display is not focused
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            view.keyDown(with: event)
-            return nil
-        }
-        _ = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDragged) { event in
-            view.rightMouseDragged(with: event)
-            return nil
+        if !desktopMode {
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                view.keyDown(with: event)
+                return nil
+            }
+            _ = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDragged) { event in
+                view.rightMouseDragged(with: event)
+                return nil
+            }
         }
 
         // Pacing from the specific headset display via CVDisplayLink:
@@ -2281,6 +2336,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             print("[display] !!! CVDisplayLink failed to create — falling back to the MTKView timer")
             view.isPaused = false
+        }
+
+        if desktopMode {
+            print("[desktop] Controls: headset Fn button — recenter (long press: include pitch) · "
+                + "\(DesktopHotKey.emergencyQuit.label) — quit")
+            return
         }
 
         // No file — open the picker in the headset right away
@@ -2735,6 +2796,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         remuxer?.cancel(wait: true)
         renderer?.video?.savePosition()
         renderer?.overlay?.hide()
+        renderer?.desktop?.stop()
         if let link = cvLink {
             CVDisplayLinkStop(link)
         }
@@ -2765,12 +2827,14 @@ if isatty(STDOUT_FILENO) == 0 {
     print("[player] Started \(Date()); log: \(logPath)")
 }
 
-let args = CommandLine.arguments
-// With no argument, the file is chosen via the in-headset panel after launch
-let url: URL? = args.count > 1 ? URL(fileURLWithPath: args[1]) : nil
+// --desktop (player/desk) switches to desktop mode; any other argument is a
+// video file. With no file, it is chosen via the in-headset panel after launch
+let args = CommandLine.arguments.dropFirst()
+let desktopMode = args.contains("--desktop")
+let url: URL? = args.first { !$0.hasPrefix("--") }.map { URL(fileURLWithPath: $0) }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
-let delegate = AppDelegate(videoURL: url)
+let delegate = AppDelegate(videoURL: url, desktopMode: desktopMode)
 app.delegate = delegate
 app.run()

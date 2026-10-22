@@ -69,6 +69,9 @@ final class UIOverlay {
     // Where to teleport the real cursor on capture (headset screen center, CG coordinates)
     var warpPoint: CGPoint?
     var captureEnabled = true
+    // Desktop mode: the mouse works on the captured display, so movement
+    // never wakes the panel and there is no file picker — only OSD toasts
+    var desktopMode = false
 
     weak var renderer: Renderer?
     var onOpenFile: ((URL) -> Void)?
@@ -448,7 +451,7 @@ final class UIOverlay {
             if active && !rightHeld {
                 cursorU = min(1 + Self.marginU, max(-Self.marginU, cursorU + Double(dx) / 900.0))
                 cursorV = min(1 + Self.marginV, max(-Self.marginV, cursorV + Double(dy) / 450.0))
-            } else if !active && !rightHeld && hmdWorn
+            } else if !active && !rightHeld && hmdWorn && !desktopMode
                         && renderer?.passthrough?.active != true {
                 // In camera mode there is no UI at all: the panel doesn't
                 // appear and the mouse isn't captured — you can just look
@@ -491,7 +494,7 @@ final class UIOverlay {
         // Without an open video the hidden panel means an empty gray scene:
         // whoever puts on the headset won't guess to move the mouse, so keep
         // the file list on screen ourselves
-        if !active && hmdWorn && NSApp.isActive && renderer?.video == nil
+        if !active && hmdWorn && NSApp.isActive && renderer?.video == nil && !desktopMode
             && renderer?.passthrough?.active != true {
             if mode != .picker {
                 openPicker()

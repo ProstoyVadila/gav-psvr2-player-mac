@@ -1,0 +1,29 @@
+#!/bin/zsh
+# Desktop mode: a macOS display shown as a panel in the headset (see
+# desktop.swift). Same as play, plus --desktop: launched via open so the app,
+# not the terminal, is the "responsible" process for permissions (Screen
+# Recording). The app log is streamed here from ~/Library/Logs/PSVR2Player.log.
+cd "$(dirname "$0")"
+
+APP="$PWD/PSVR2Player.app"
+BIN="$APP/Contents/MacOS/psvr2player"
+LOG="$HOME/Library/Logs/PSVR2Player.log"
+
+if [[ ! -x "$BIN" ]]; then
+	echo "No built application. Run: make" >&2
+	exit 1
+fi
+
+: > "$LOG"
+open -a "$APP" --args --desktop "$@" || exit 1
+
+# Show the log while the application is running (-F: the player truncates
+# the file on startup)
+tail -F "$LOG" 2>/dev/null &
+TAIL_PID=$!
+trap 'kill $TAIL_PID 2>/dev/null' EXIT INT TERM
+
+sleep 1
+while pgrep -qf "PSVR2Player.app/Contents/MacOS/psvr2player"; do
+	sleep 1
+done
