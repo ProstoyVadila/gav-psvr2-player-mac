@@ -14,6 +14,7 @@ import CoreAudio
 enum DesktopHotKey: UInt32, CaseIterable {
     case emergencyQuit = 1
     case narrower, wider, nearer, farther, resetPanel
+    case flatter, curvier
     case cycleMode
 
     private static let ctrlOptCmd = UInt32(controlKey | optionKey | cmdKey)
@@ -26,6 +27,8 @@ enum DesktopHotKey: UInt32, CaseIterable {
         case .nearer: return UInt32(kVK_DownArrow)
         case .farther: return UInt32(kVK_UpArrow)
         case .resetPanel: return UInt32(kVK_ANSI_0)
+        case .flatter: return UInt32(kVK_ANSI_LeftBracket)
+        case .curvier: return UInt32(kVK_ANSI_RightBracket)
         case .cycleMode: return UInt32(kVK_ANSI_M)
         }
     }
@@ -45,6 +48,8 @@ enum DesktopHotKey: UInt32, CaseIterable {
         case .nearer: return "⌃⌥⌘↓"
         case .farther: return "⌃⌥⌘↑"
         case .resetPanel: return "⌃⌥⌘0"
+        case .flatter: return "⌃⌥⌘["
+        case .curvier: return "⌃⌥⌘]"
         case .cycleMode: return "⌃⌥⌘M"
         }
     }
@@ -56,16 +61,21 @@ struct DesktopSettings {
     static let distanceRange: ClosedRange<Float> = 0.75...3
     static let defaultWidthDeg: Float = 90
     static let defaultDistanceM: Float = 1.5
+    static let defaultCurvature: Float = 0.5
 
     // Angular width of the panel; the height follows the display's aspect
     var widthDeg: Float {
         didSet { widthDeg = min(max(widthDeg, Self.widthRange.lowerBound), Self.widthRange.upperBound) }
     }
-    // Perceived distance. Until the panel geometry gets real depth (M4) it
-    // only sets the stereo disparity; the angular size stays the same, so
+    // Distance to the panel's center; the angular size stays the same, so
     // text doesn't change size when the panel moves
     var distanceM: Float {
         didSet { distanceM = min(max(distanceM, Self.distanceRange.lowerBound), Self.distanceRange.upperBound) }
+    }
+    // 0: flat, 1: an arc centered on the head (every column at the same
+    // distance); in between the edges bend toward the viewer
+    var curvature: Float {
+        didSet { curvature = min(max(curvature, 0), 1) }
     }
     var modeIndex: Int {
         didSet { modeIndex = (modeIndex % DeskMode.all.count + DeskMode.all.count) % DeskMode.all.count }
@@ -76,6 +86,7 @@ struct DesktopSettings {
         return DesktopSettings(
             widthDeg: d.object(forKey: "desk.widthDeg") as? Float ?? defaultWidthDeg,
             distanceM: d.object(forKey: "desk.distanceM") as? Float ?? defaultDistanceM,
+            curvature: d.object(forKey: "desk.curvature") as? Float ?? defaultCurvature,
             modeIndex: d.object(forKey: "desk.modeIndex") as? Int ?? DeskMode.defaultIndex)
     }
 
@@ -83,6 +94,7 @@ struct DesktopSettings {
         let d = UserDefaults.standard
         d.set(widthDeg, forKey: "desk.widthDeg")
         d.set(distanceM, forKey: "desk.distanceM")
+        d.set(curvature, forKey: "desk.curvature")
         d.set(modeIndex, forKey: "desk.modeIndex")
     }
 
@@ -109,18 +121,41 @@ final class DesktopMode {
     var onNotice: ((String, Double) -> Void)?
     var onArranged: (() -> Void)?
 
-    // Half the typical IPD, for the disparity of a panel at distanceM
-    private static let halfIPD: Float = 0.0315
-
     init(device: MTLDevice, queue: MTLCommandQueue, headsetID: CGDirectDisplayID?) {
         self.headsetID = headsetID
         virtual = VirtualDisplay()
         capture = ScreenCapture(displayID: virtual?.displayID ?? CGMainDisplayID(), device: device, queue: queue)
     }
 
-    // Panel geometry for the renderer: angular width and per-eye disparity in tan units
-    var panelWidthDeg: Float { settings.widthDeg }
-    var panelDisparity: Float { Self.halfIPD / settings.distanceM }
+    // Panel geometry for the shader's panel_hit (Uniforms.p8/p9), meters.
+    // The width setting is the angle the panel spans as seen from the head,
+    // whatever the curvature, so bending it doesn't change its apparent size
+    func panelGeometry(aspect: Float, ipdMM: Float) -> (g: SIMD4<Float>, h: SIMD4<Float>) {
+        let r = settings.distanceM
+        let halfAngle = settings.widthDeg * .pi / 360
+        let k = settings.curvature
+        let halfIPD = ipdMM / 2000
+        if k < 0.01 {
+            let halfW = r * tanf(halfAngle)
+            return (SIMD4(r, 0, halfW, halfW / aspect), SIMD4(halfIPD, 0, 2 * halfW, 0))
+        }
+        // Cylinder of radius r/k with its front at distance r: find the arc
+        // half-angle whose edge is seen from the head at halfAngle (monotonic,
+        // so a bisection is enough)
+        let rc = r / k
+        func seenAngle(_ phi: Float) -> Float {
+            atan2f(rc * sinf(phi), r - rc + rc * cosf(phi))
+        }
+        var lo: Float = 0
+        var hi: Float = .pi
+        for _ in 0..<40 {
+            let mid = (lo + hi) / 2
+            if seenAngle(mid) < halfAngle { lo = mid } else { hi = mid }
+        }
+        let phiMax = (lo + hi) / 2
+        let width = 2 * rc * phiMax // arc length
+        return (SIMD4(r, rc, phiMax, width / aspect / 2), SIMD4(halfIPD, 0, width, 0))
+    }
 
     func start() {
         registerHotKeys()
@@ -201,15 +236,19 @@ final class DesktopMode {
         case .wider: settings.widthDeg += 5
         case .nearer: settings.distanceM -= 0.25
         case .farther: settings.distanceM += 0.25
+        case .flatter: settings.curvature -= 0.25
+        case .curvier: settings.curvature += 0.25
         case .resetPanel:
             settings.widthDeg = DesktopSettings.defaultWidthDeg
             settings.distanceM = DesktopSettings.defaultDistanceM
+            settings.curvature = DesktopSettings.defaultCurvature
         case .cycleMode:
             cycleMode()
             return
         }
         settings.save()
-        let text = String(format: "Panel %.0f° · %.2f m", settings.widthDeg, settings.distanceM)
+        let text = String(format: "Panel %.0f° · %.2f m · curve %.2f",
+                          settings.widthDeg, settings.distanceM, settings.curvature)
         print("[desktop] \(text)")
         onNotice?(text, 1.5)
     }

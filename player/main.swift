@@ -49,6 +49,8 @@ struct Uniforms {
     float4 p5;       // x: passthrough on, y: camera FOV (rad), z: brightness, w: camera mode
     float4 p6;       // x: camera convergence, y: video stereo depth (fractions of frame)
     float4 p7;       // flat screen: half-sizes in tan units (xy), eye disparity (z), background brightness (w)
+    float4 p8;       // desktop panel: distance R m (x), cylinder radius m, 0 = flat (y), half width: rad on the cylinder / m flat (z), half height m (w)
+    float4 p9;       // desktop panel: half IPD m (x), vertical center m (y), full width m (z)
 };
 
 constant float FX = 0.3585564;
@@ -113,6 +115,56 @@ static float2 flat_uv(float3 w, int eye, float4 p, thread bool &valid) {
     float2 uv = float2(sx / (2.0 * p.x) + 0.5, 0.5 - sy / (2.0 * p.y));
     valid = all(uv >= 0.0) && all(uv <= 1.0);
     return uv;
+}
+
+// Desktop panel (mode 4): a real surface in meters around the head, hit by
+// a ray from each eye (head center ± half the IPD), so stereo depth comes
+// out right by itself. g.y > 0: a vertical cylinder of radius g.y whose
+// front is at distance g.x (its axis sits behind the head when the radius is
+// bigger than the distance — a gentle curve); g.y == 0: a plane at g.x.
+// Returns the uv on the panel, the ray length and the cosine between the
+// ray and the surface normal (for the texture footprint)
+static bool panel_hit(float3 o, float3 d, float4 g, float4 h,
+                      thread float2 &uv, thread float &dist, thread float &cosI) {
+    float R = g.x;
+    float Rc = g.y;
+    float3 p;
+    float3 n;
+    if (Rc <= 0.0) {
+        if (d.z > -1e-4) {
+            return false;
+        }
+        dist = (-R - o.z) / d.z;
+        p = o + dist * d;
+        n = float3(0.0, 0.0, 1.0);
+        uv.x = p.x / (2.0 * g.z) + 0.5;
+    } else {
+        // Circle in the xz plane around (0, cz); the viewer is inside, so
+        // the far root is the hit
+        float cz = Rc - R;
+        float2 oc = float2(o.x, o.z - cz);
+        float a = dot(d.xz, d.xz);
+        if (a < 1e-8) {
+            return false;
+        }
+        float b = dot(oc, d.xz);
+        float c = dot(oc, oc) - Rc * Rc;
+        float disc = b * b - a * c;
+        if (disc < 0.0) {
+            return false;
+        }
+        dist = (-b + sqrt(disc)) / a;
+        if (dist <= 0.0) {
+            return false;
+        }
+        p = o + dist * d;
+        float2 q = float2(p.x, p.z - cz);
+        n = float3(-q.x, 0.0, -q.y) / Rc;
+        uv.x = atan2(q.x, -q.y) / (2.0 * g.z) + 0.5;
+    }
+    uv.y = 0.5 - (p.y - h.y) / (2.0 * g.w);
+    cosI = max(fabs(dot(d, n)), 0.2);
+    return all(uv >= 0.0) && all(uv <= 1.0);
 }
 
 // Frames come in native YUV 4:2:0 (a third of the memory of BGRA: critical
@@ -231,7 +283,24 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         float depthShift = stereo == 0 ? 0.0 : (eye == 0 ? uni.p6.y : -uni.p6.y);
         bool valid;
         float3 sampled;
-        if (mode == 3) {
+        if (mode == 4) {
+            // Desktop panel. Eye position: head center ± half IPD along the
+            // head's X axis, rotated into the world with the head
+            float3 eyePos = (uni.rot * float4(eye == 0 ? -uni.p9.x : uni.p9.x, 0.0, 0.0, 0.0)).xyz;
+            float2 puv;
+            float dist;
+            float cosI;
+            sampled = float3(0.0); // OLED black around the panel
+            if (hasVideo && panel_hit(eyePos, w, uni.p8, uni.p9, puv, dist, cosI)) {
+                // One output pixel covers pixTan radians (see mode 3), i.e.
+                // pixTan * dist / cosI meters on the panel; texels from the
+                // panel's width in meters
+                float pixTan = 0.000921 * scale[ch] * length(float2(k3, k4));
+                float texels = pixTan * dist / cosI / uni.p9.z * float(videoY.get_width());
+                float lod = max(log2(max(texels, 1e-6)), 0.0);
+                sampled = sample_video(videoY, videoCbCr, smpMip, puv, lod, uni.p4);
+            }
+        } else if (mode == 3) {
             float2 suv = flat_uv(w, eye, uni.p7, valid);
             suv.x += depthShift;
             if (!valid || suv.x < 0.0 || suv.x > 1.0) {
@@ -701,6 +770,8 @@ struct Uniforms {
     var p5: SIMD4<Float> // passthrough on, camera FOV (rad), brightness, camera mode
     var p6: SIMD4<Float> // camera convergence, video stereo depth
     var p7: SIMD4<Float> // flat screen: half-sizes in tan units, eye disparity, background brightness
+    var p8: SIMD4<Float> = .zero // desktop panel: distance, cylinder radius (0 = flat), half width, half height
+    var p9: SIMD4<Float> = .zero // desktop panel: half IPD, vertical center, full width (meters)
 }
 
 // MARK: - Video
@@ -1209,6 +1280,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     // Desktop mode (--desktop): a captured macOS display on a flat panel
     // instead of a video. Set once at launch; nil in the video player
     var desktop: DesktopMode?
+    // Headset IPD dial, mm (63 until the status stream reports it)
+    private var ipdMM: Int32 = 63
     // Every change made while a file is open (keys, Format menu) is a manual
     // choice: remembered per file unless it matches the automatic guess
     var config: PlaybackConfig {
@@ -1451,14 +1524,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     // units from the width angle and the eye picture aspect, disparity,
     // surround brightness (0 — black while the panorama is not loaded yet)
     private func flatScreenParams(_ flat: Bool) -> SIMD4<Float> {
-        guard flat else { return SIMD4(1, 1, 0, 0) }
-        if let desktop {
-            // Black around the panel (OLED); aspect of the captured display
-            let size = ScreenCapture.pixelSize(of: desktop.capture.displayID)
-            let aspect = size.height > 0 ? Float(size.width) / Float(size.height) : 16 / 9
-            let halfW = tanf(desktop.panelWidthDeg * .pi / 360)
-            return SIMD4(halfW, halfW / aspect, desktop.panelDisparity, 0)
-        }
+        // Desktop mode has its own panel geometry (p8/p9)
+        guard flat, desktop == nil else { return SIMD4(1, 1, 0, 0) }
         let aspect = PlaybackConfig.flatAspect(
             width: video?.textureY?.width ?? 0, height: video?.textureY?.height ?? 0,
             stereo: config.stereo)
@@ -1534,6 +1601,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         var prox: Int32 = 0
         var ipd: Int32 = 0
         psvr2_get_status(&prox, &ipd)
+        ipdMM = ipd
         let raw = prox == 1
 
         let now = CACurrentMediaTime()
@@ -1692,6 +1760,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         // With no file open, show the environment panorama: it goes through
         // the shader's video path as a 360° mono BGRA "video"
         let env = video == nil && desktop == nil ? envTexture : nil
+        let deskGeometry = desktop.map { d -> (g: SIMD4<Float>, h: SIMD4<Float>) in
+            let size = ScreenCapture.pixelSize(of: d.capture.displayID)
+            return d.panelGeometry(aspect: size.height > 0 ? Float(size.width) / Float(size.height) : 16 / 9,
+                                   ipdMM: Float(ipdMM))
+        }
         let projection: Projection = desktop != nil ? .flat : (env != nil ? .equirect360 : config.projection)
         let stereo: StereoLayout = desktop != nil || env != nil ? .mono : config.stereo
 
@@ -1701,7 +1774,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             calibL: SIMD4(calibration[0], calibration[1], calibration[4], calibration[5]),
             calibR: SIMD4(calibration[2], calibration[3], calibration[6], calibration[7]),
             p0: SIMD4(
-                Float(projection.rawValue),
+                desktop != nil ? 4 : Float(projection.rawValue), // 4: desktop panel (see panel_hit)
                 Float(stereo.rawValue),
                 config.fisheyeFovDeg * .pi / 180,
                 env != nil || desktop != nil ? 1 : config.flipV),
@@ -1725,7 +1798,9 @@ final class Renderer: NSObject, MTKViewDelegate {
                 passthrough?.brightness ?? 1.6,
                 Float(passthrough?.source.rawValue ?? 0)),
             p6: SIMD4(passthrough?.convergence ?? 0, env != nil || desktop != nil ? 0 : config.depth, 0, 0),
-            p7: flatScreenParams(flat))
+            p7: flatScreenParams(flat),
+            p8: deskGeometry?.g ?? .zero,
+            p9: deskGeometry?.h ?? .zero)
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -2400,6 +2475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 + "\(DesktopHotKey.emergencyQuit.label) — quit")
             print("[desktop]           \(DesktopHotKey.narrower.label)/\(DesktopHotKey.wider.label) panel size · "
                 + "\(DesktopHotKey.nearer.label)/\(DesktopHotKey.farther.label) distance · "
+                + "\(DesktopHotKey.flatter.label)/\(DesktopHotKey.curvier.label) curve · "
                 + "\(DesktopHotKey.resetPanel.label) reset · \(DesktopHotKey.cycleMode.label) next display mode")
             return
         }
