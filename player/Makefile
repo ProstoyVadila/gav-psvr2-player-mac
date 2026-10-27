@@ -14,7 +14,7 @@ ifeq ($(strip $(SIGN_ID)),)
 SIGN_ID = -
 endif
 SWIFT_SRC = main.swift overlay.swift sweeper.swift meta.swift passthrough.swift remux.swift \
-	screen_capture.swift desktop.swift virtual_display.swift
+	screen_capture.swift desktop.swift desk_bar.swift virtual_display.swift
 
 all: $(APP)
 

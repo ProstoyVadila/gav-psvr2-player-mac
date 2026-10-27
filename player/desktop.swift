@@ -101,6 +101,19 @@ struct DesktopSettings {
     var mode: DeskMode { DeskMode.all[modeIndex] }
 }
 
+// The captured display and the cursor on it, as of the last cursor-guard tick
+struct DisplaySnapshot {
+    var cursor: CGPoint // global CG coordinates
+    var bounds: CGRect
+    var pixelSize: (width: Int, height: Int)
+
+    static func read(_ id: CGDirectDisplayID) -> DisplaySnapshot {
+        let b = CGDisplayBounds(id)
+        return DisplaySnapshot(cursor: CGEvent(source: nil)?.location ?? CGPoint(x: b.midX, y: b.midY),
+                               bounds: b, pixelSize: ScreenCapture.pixelSize(of: id))
+    }
+}
+
 final class DesktopMode {
     let capture: ScreenCapture
     private(set) var settings = DesktopSettings.load()
@@ -111,7 +124,10 @@ final class DesktopMode {
     private var sweeper: WindowSweeper?
     private var hotKeyRefs: [EventHotKeyRef] = []
     private var hotKeyHandler: EventHandlerRef?
-    private var cursorGuard: Timer?
+    private var cursorGuard: DispatchSourceTimer?
+    private let guardQueue = DispatchQueue(label: "desktop.cursor-guard", qos: .userInteractive)
+    private let snapshotLock = NSLock()
+    private var snapshotValue: DisplaySnapshot
     private var arranged = false
     // System audio outputs before switching them to the headset, for restore
     private var savedAudio: [(selector: AudioObjectPropertySelector, id: AudioDeviceID)] = []
@@ -120,21 +136,53 @@ final class DesktopMode {
     // layout has changed (the headset window must follow its display)
     var onNotice: ((String, Double) -> Void)?
     var onArranged: (() -> Void)?
+    var onRecenter: (() -> Void)?
+
+    // Control bar under the panel (desk_bar.swift)
+    let bar: DesktopBar
+    private(set) var switchingMode = false
 
     init(device: MTLDevice, queue: MTLCommandQueue, headsetID: CGDirectDisplayID?) {
         self.headsetID = headsetID
-        virtual = VirtualDisplay()
+        virtual = VirtualDisplay(mode: DesktopSettings.load().mode)
         capture = ScreenCapture(displayID: virtual?.displayID ?? CGMainDisplayID(), device: device, queue: queue)
+        bar = DesktopBar(device: device)
+        snapshotValue = DisplaySnapshot.read(capture.displayID)
+        bar.desktop = self
     }
 
-    // Panel geometry for the shader's panel_hit (Uniforms.p8/p9), meters.
-    // The width setting is the angle the panel spans as seen from the head,
-    // whatever the curvature, so bending it doesn't change its apparent size
+    // What the render loop needs from WindowServer each frame, read off the
+    // main thread. Asking WindowServer synchronously (cursor position,
+    // display bounds and mode) can stall for milliseconds while it composites
+    // the big virtual display; on the main thread that made frames late by
+    // a varying amount and the panel trembled
+    var snapshot: DisplaySnapshot {
+        snapshotLock.lock()
+        defer { snapshotLock.unlock() }
+        return snapshotValue
+    }
+
+    private func storeSnapshot(_ value: DisplaySnapshot) {
+        snapshotLock.lock()
+        snapshotValue = value
+        snapshotLock.unlock()
+    }
+
+    // Panel geometry for the shader's panel_hit (Uniforms.p8/p9), meters
     func panelGeometry(aspect: Float, ipdMM: Float) -> (g: SIMD4<Float>, h: SIMD4<Float>) {
+        var s = surface(widthDeg: settings.widthDeg, aspect: aspect)
+        s.h.x = ipdMM / 2000
+        return s
+    }
+
+    // A rectangle on the panel's surface (same distance and curvature) that
+    // spans widthDeg as seen from the head, whatever the curvature, so
+    // bending it doesn't change its apparent size
+    func surface(widthDeg: Float, aspect: Float) -> (g: SIMD4<Float>, h: SIMD4<Float>) {
         let r = settings.distanceM
-        let halfAngle = settings.widthDeg * .pi / 360
+        let halfAngle = widthDeg * .pi / 360
         let k = settings.curvature
-        let halfIPD = ipdMM / 2000
+        let halfIPD: Float = 0
         if k < 0.01 {
             let halfW = r * tanf(halfAngle)
             return (SIMD4(r, 0, halfW, halfW / aspect), SIMD4(halfIPD, 0, 2 * halfW, 0))
@@ -174,22 +222,27 @@ final class DesktopMode {
     // The new display's modes show up in CoreGraphics a moment after creation
     private func waitForModes(attempt: Int) {
         guard let virtual else { return }
-        if virtual.cgMode(for: settings.mode) != nil {
-            arranger.arrange(virtual: virtual, mode: settings.mode, headset: headsetID)
-            arranged = true
-            onArranged?()
-            if arranger.builtInPolicy == .guarded {
-                onNotice?("Built-in display could not mirror — kept out of reach instead", 5)
+        let ready = virtual.cgMode(for: settings.mode) != nil
+        if ready || attempt >= 30 {
+            // Never leave the virtual display as a side screen: without the
+            // arrangement the apps stay on the built-in display, out of sight
+            if !ready {
+                print("[desktop] !!! \(settings.mode.label) never appeared — arranging anyway")
+                virtual.logAvailableModes()
             }
-            startCapture()
-        } else if attempt < 30 {
+            arranger.arrange(virtual: virtual, mode: settings.mode) { [weak self] in
+                guard let self else { return }
+                self.arranged = true
+                self.onArranged?()
+                if self.arranger.builtInPolicy == .guarded {
+                    self.onNotice?("Built-in display could not mirror — kept out of reach instead", 5)
+                }
+                self.startCapture()
+            }
+        } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 self?.waitForModes(attempt: attempt + 1)
             }
-        } else {
-            print("[desktop] !!! virtual display modes never appeared — capturing it unarranged")
-            virtual.logAvailableModes()
-            startCapture()
         }
     }
 
@@ -200,7 +253,7 @@ final class DesktopMode {
     }
 
     func stop() {
-        cursorGuard?.invalidate()
+        cursorGuard?.cancel()
         cursorGuard = nil
         sweeper?.stop()
         sweeper = nil
@@ -232,40 +285,57 @@ final class DesktopMode {
             // Display restore lives in applicationWillTerminate
             NSApp.terminate(nil)
             return
-        case .narrower: settings.widthDeg -= 5
-        case .wider: settings.widthDeg += 5
-        case .nearer: settings.distanceM -= 0.25
-        case .farther: settings.distanceM += 0.25
-        case .flatter: settings.curvature -= 0.25
-        case .curvier: settings.curvature += 0.25
-        case .resetPanel:
-            settings.widthDeg = DesktopSettings.defaultWidthDeg
-            settings.distanceM = DesktopSettings.defaultDistanceM
-            settings.curvature = DesktopSettings.defaultCurvature
-        case .cycleMode:
-            cycleMode()
-            return
+        case .narrower: adjust { $0.widthDeg -= 5 }
+        case .wider: adjust { $0.widthDeg += 5 }
+        case .nearer: adjust { $0.distanceM -= 0.25 }
+        case .farther: adjust { $0.distanceM += 0.25 }
+        case .flatter: adjust { $0.curvature -= 0.25 }
+        case .curvier: adjust { $0.curvature += 0.25 }
+        case .resetPanel: resetPanel()
+        case .cycleMode: stepMode(by: 1)
         }
-        settings.save()
-        let text = String(format: "Panel %.0f° · %.2f m · curve %.2f",
-                          settings.widthDeg, settings.distanceM, settings.curvature)
-        print("[desktop] \(text)")
-        onNotice?(text, 1.5)
     }
 
-    // Temporary (M5 replaces it with the settings panel): next mode in the table
-    private func cycleMode() {
+    // Panel size/distance/curve change (hotkeys and the control bar)
+    func adjust(_ change: (inout DesktopSettings) -> Void) {
+        change(&settings)
+        settings.save()
+        bar.redrawSoon()
+        print(String(format: "[desktop] panel %.0f° · %.2f m · curve %.2f",
+                     settings.widthDeg, settings.distanceM, settings.curvature))
+    }
+
+    func resetPanel() {
+        adjust {
+            $0.widthDeg = DesktopSettings.defaultWidthDeg
+            $0.distanceM = DesktopSettings.defaultDistanceM
+            $0.curvature = DesktopSettings.defaultCurvature
+        }
+    }
+
+    // Next/previous mode in the table; one switch at a time
+    func stepMode(by step: Int) {
         guard let virtual, arranged else {
             onNotice?("Display modes need the virtual display", 2)
             return
         }
-        settings.modeIndex += 1
+        guard !switchingMode else { return }
+        switchingMode = true
+        settings.modeIndex += step
         settings.save()
+        bar.redrawSoon()
         let mode = settings.mode
-        let ok = arranger.setMode(mode, on: virtual)
-        capture.updateSize()
-        onArranged?()
-        onNotice?(ok ? "Display: \(mode.label)" : "Display mode \(mode.label) failed (see log)", 2)
+        print("[desktop] switching to \(mode.label)")
+        arranger.setMode(mode, on: virtual) { [weak self] ok in
+            guard let self else { return }
+            self.switchingMode = false
+            self.capture.updateSize()
+            self.onArranged?()
+            self.bar.redrawSoon()
+            if !ok {
+                self.onNotice?("Display mode \(mode.label) failed (see log)", 3)
+            }
+        }
     }
 
     // MARK: Audio
@@ -304,17 +374,26 @@ final class DesktopMode {
 
     // The only display the user can see is the captured one: a cursor that
     // drifts onto the headset display (or any other screen) is invisible and
-    // its clicks land on the wrong app. Polled at 250 Hz and warped back to
-    // the nearest point inside the captured display. Coordinates are global
-    // CG space (origin top-left of the main display, y down) for both
-    // CGDisplayBounds and CGEvent.location
+    // its clicks land on the wrong app. Polled at 250 Hz on its own queue
+    // (never the main thread, see snapshot) and warped back to the nearest
+    // point inside the captured display; each tick also refreshes the
+    // snapshot. Coordinates are global CG space (origin top-left of the main
+    // display, y down) for both CGDisplayBounds and CGEvent.location
     private func startCursorGuard() {
         guard cursorGuard == nil else { return }
         warpCursorToCenter()
-        let timer = Timer(timeInterval: 1.0 / 250, repeats: true) { [weak self] _ in
-            self?.guardCursor()
+        let timer = DispatchSource.makeTimerSource(queue: guardQueue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .milliseconds(1))
+        var tick = 0
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            // The mode only changes on a switch: re-read it ~10 times a second
+            tick += 1
+            let pixelSize = tick % 25 == 0
+                ? ScreenCapture.pixelSize(of: self.capture.displayID) : self.snapshot.pixelSize
+            self.storeSnapshot(self.guardCursor(pixelSize: pixelSize))
         }
-        RunLoop.main.add(timer, forMode: .common) // keeps firing during menu tracking and drags
+        timer.resume()
         cursorGuard = timer
     }
 
@@ -323,15 +402,19 @@ final class DesktopMode {
         warpCursor(to: CGPoint(x: b.midX, y: b.midY))
     }
 
-    private func guardCursor() {
-        guard let p = CGEvent(source: nil)?.location else { return }
+    // On guardQueue
+    private func guardCursor(pixelSize: (width: Int, height: Int)) -> DisplaySnapshot {
         let b = CGDisplayBounds(capture.displayID)
+        guard let p = CGEvent(source: nil)?.location else {
+            return DisplaySnapshot(cursor: CGPoint(x: b.midX, y: b.midY), bounds: b, pixelSize: pixelSize)
+        }
         // maxX/maxY themselves belong to the neighbouring display
         let inside = CGPoint(x: min(max(p.x, b.minX), b.maxX - 1),
                              y: min(max(p.y, b.minY), b.maxY - 1))
         if inside != p {
             warpCursor(to: inside)
         }
+        return DisplaySnapshot(cursor: inside, bounds: b, pixelSize: pixelSize)
     }
 
     private func warpCursor(to point: CGPoint) {
@@ -350,7 +433,9 @@ final class DesktopMode {
         let captured = capture.displayID
         let sweeper = WindowSweeper(
             forbiddenFrames: { [weak self] in
-                ([headsetID] + (self?.arranger.farDisplays ?? []))
+                // Called on the sweeper's queue; the arranger lives on main
+                let far = DispatchQueue.main.sync { self?.arranger.farDisplays ?? [] }
+                return ([headsetID] + far)
                     .filter { $0 != captured }
                     .map { CGDisplayBounds($0) }
             },

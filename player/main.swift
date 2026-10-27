@@ -51,6 +51,7 @@ struct Uniforms {
     float4 p7;       // flat screen: half-sizes in tan units (xy), eye disparity (z), background brightness (w)
     float4 p8;       // desktop panel: distance R m (x), cylinder radius m, 0 = flat (y), half width: rad on the cylinder / m flat (z), half height m (w)
     float4 p9;       // desktop panel: half IPD m (x), vertical center m (y), full width m (z)
+    float4 p10;      // desktop control bar on the panel's surface: half width (x, like p8.z), half height m (y), vertical center m (z)
 };
 
 constant float FX = 0.3585564;
@@ -209,7 +210,8 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                         texture2d<float> videoCbCr [[texture(2)]],
                         texture2d<float> camL [[texture(3)]],
                         texture2d<float> camR [[texture(4)]],
-                        texture2d<float> env [[texture(5)]]) {
+                        texture2d<float> env [[texture(5)]],
+                        texture2d<float> bar [[texture(6)]]) {
     constexpr sampler smp(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     // Flat screen: the video comes as a mipmapped copy (see Renderer.mipmappedVideo)
     constexpr sampler smpMip(mag_filter::linear, min_filter::linear, mip_filter::linear,
@@ -299,6 +301,13 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                 float texels = pixTan * dist / cosI / uni.p9.z * float(videoY.get_width());
                 float lod = max(log2(max(texels, 1e-6)), 0.0);
                 sampled = sample_video(videoY, videoCbCr, smpMip, puv, lod, uni.p4);
+            } else if (uni.p10.y > 0.0) {
+                // Control bar (DesktopBar): the same surface, a strip below
+                float4 bg = float4(uni.p8.x, uni.p8.y, uni.p10.x, uni.p10.y);
+                float4 bh = float4(uni.p9.x, uni.p10.z, 0.0, 0.0);
+                if (panel_hit(eyePos, w, bg, bh, puv, dist, cosI)) {
+                    sampled = bar.sample(smp, puv).rgb; // premultiplied, over black
+                }
             }
         } else if (mode == 3) {
             float2 suv = flat_uv(w, eye, uni.p7, valid);
@@ -772,6 +781,7 @@ struct Uniforms {
     var p7: SIMD4<Float> // flat screen: half-sizes in tan units, eye disparity, background brightness
     var p8: SIMD4<Float> = .zero // desktop panel: distance, cylinder radius (0 = flat), half width, half height
     var p9: SIMD4<Float> = .zero // desktop panel: half IPD, vertical center, full width (meters)
+    var p10: SIMD4<Float> = .zero // desktop control bar: half width, half height, vertical center
 }
 
 // MARK: - Video
@@ -1693,6 +1703,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         updateProximity()
 
         overlay?.tick()
+        desktop?.bar.tick()
         video?.updateTexture()
         passthrough?.update()
 
@@ -1761,7 +1772,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         // the shader's video path as a 360° mono BGRA "video"
         let env = video == nil && desktop == nil ? envTexture : nil
         let deskGeometry = desktop.map { d -> (g: SIMD4<Float>, h: SIMD4<Float>) in
-            let size = ScreenCapture.pixelSize(of: d.capture.displayID)
+            let size = d.snapshot.pixelSize // not CGDisplayCopyDisplayMode per frame (see snapshot)
             return d.panelGeometry(aspect: size.height > 0 ? Float(size.width) / Float(size.height) : 16 / 9,
                                    ipdMM: Float(ipdMM))
         }
@@ -1800,7 +1811,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             p6: SIMD4(passthrough?.convergence ?? 0, env != nil || desktop != nil ? 0 : config.depth, 0, 0),
             p7: flatScreenParams(flat),
             p8: deskGeometry?.g ?? .zero,
-            p9: deskGeometry?.h ?? .zero)
+            p9: deskGeometry?.h ?? .zero,
+            p10: deskGeometry.flatMap { g in desktop?.bar.geometry(panel: g) } ?? .zero)
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -1811,6 +1823,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setFragmentTexture(passthrough?.textureL ?? placeholderY, index: 3)
         enc.setFragmentTexture(passthrough?.textureR ?? placeholderY, index: 4)
         enc.setFragmentTexture(envTexture ?? placeholderY, index: 5)
+        enc.setFragmentTexture(desktop?.bar.texture ?? placeholderY, index: 6)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         // Ground truth for the pose lookahead: when the frame really hit the
@@ -2320,6 +2333,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             desktop.onArranged = { [weak self] in
                 self?.fitHeadsetWindow()
             }
+            desktop.onRecenter = { [weak renderer] in
+                renderer?.tracker.requestRecenter()
+                print("[desktop] recenter (control bar)")
+            }
             // pkill / Ctrl-C: quit through applicationWillTerminate so the
             // display layout is restored (crashes are covered by .forAppOnly)
             for sig in [SIGTERM, SIGINT] {
@@ -2471,7 +2488,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if desktopMode {
-            print("[desktop] Controls: headset Fn button — recenter (long press: include pitch) · "
+            print("[desktop] Controls: rest the mouse on the bottom edge — control bar under the panel · "
+                + "headset Fn button — recenter (long press: include pitch) · "
                 + "\(DesktopHotKey.emergencyQuit.label) — quit")
             print("[desktop]           \(DesktopHotKey.narrower.label)/\(DesktopHotKey.wider.label) panel size · "
                 + "\(DesktopHotKey.nearer.label)/\(DesktopHotKey.farther.label) distance · "

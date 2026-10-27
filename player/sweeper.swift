@@ -3,7 +3,10 @@
 // and moves them to the monitor (requires the Accessibility permission), or
 // warns with an OSD plate. Desktop mode passes several forbidden displays and
 // the virtual display as the target; the frames are re-read on every sweep
-// because the display arrangement can change while running.
+// because the display arrangement can change while running. Sweeps run on a
+// background queue: the window list and AX calls into other apps can block
+// for a long time (an app that hangs), which on the main thread stalls the
+// render loop.
 
 import AppKit
 import ApplicationServices
@@ -12,10 +15,11 @@ final class WindowSweeper {
     // CG coordinates: y down from the top of the main screen
     private let forbiddenFrames: () -> [CGRect] // displays the user can't see
     private let targetFrame: () -> CGRect       // where to move windows
-    private var timer: Timer?
+    private var timer: DispatchSourceTimer?
+    private let queue = DispatchQueue(label: "sweeper", qos: .utility)
     // Avoid spamming plates every 2 s about the same window
     private var reported: [String: Double] = [:]
-    // app name, whether the move succeeded
+    // app name, whether the move succeeded; called on the main thread
     var onStray: ((String, Bool) -> Void)?
 
     init(forbiddenFrames: @escaping () -> [CGRect], targetFrame: @escaping () -> CGRect) {
@@ -28,13 +32,17 @@ final class WindowSweeper {
     }
 
     func start() {
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
             self?.sweep()
         }
+        timer.resume()
+        self.timer = timer
     }
 
     func stop() {
-        timer?.invalidate()
+        timer?.cancel()
         timer = nil
     }
 
@@ -65,7 +73,9 @@ final class WindowSweeper {
             let now = CACurrentMediaTime()
             if moved || (reported[key] ?? -1e9) + 30 < now {
                 reported[key] = now
-                onStray?(name, moved)
+                DispatchQueue.main.async { [weak self] in
+                    self?.onStray?(name, moved)
+                }
             }
         }
     }

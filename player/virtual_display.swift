@@ -40,7 +40,7 @@ final class VirtualDisplay {
     var displayID: CGDirectDisplayID { display.displayID }
 
     // nil when the private API is unavailable or refuses (logged)
-    init?() {
+    init?(mode: DeskMode) {
         // The class lives in CoreGraphics at runtime; check before touching it
         guard NSClassFromString("CGVirtualDisplay") != nil else {
             print("[displays] !!! CGVirtualDisplay class not found")
@@ -66,18 +66,27 @@ final class VirtualDisplay {
             return nil
         }
 
-        // With hiDPI = 1 each listed size is offered as backing pixels with a
-        // logical size of half of it ("looks like"), next to a 1× variant
-        let settings = CGVirtualDisplaySettings()
-        settings.hiDPI = 1
-        settings.modes = DeskMode.all.map {
-            CGVirtualDisplayMode(width: UInt($0.pixelWidth), height: UInt($0.pixelHeight), refreshRate: 60)
-        }
-        guard display.apply(settings) else {
+        guard setMode(mode) else {
             print("[displays] !!! CGVirtualDisplay rejected the mode list")
             return nil
         }
         print("[displays] virtual display \"PSVR2 Desk\" created, id \(display.displayID)")
+    }
+
+    // The display offers exactly one size, so that is the mode it runs in;
+    // switching = applying settings again, which lands in ~0.1 s. Measured
+    // (macOS 26): with hiDPI = 1 a listed size is the logical one and runs
+    // at 2× backing pixels — [2560×1080] gives 2560x1080 (5120x2160 px).
+    // Listing backing sizes instead gave no HiDPI mode at all, and with the
+    // whole table listed macOS picked the largest size and
+    // CGConfigureDisplayWithDisplayMode never moved it off that
+    func setMode(_ mode: DeskMode) -> Bool {
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = 1
+        settings.modes = [
+            CGVirtualDisplayMode(width: UInt(mode.width), height: UInt(mode.height), refreshRate: 60)
+        ]
+        return display.apply(settings)
     }
 
     // The CoreGraphics mode for one of our modes, or nil if the system
@@ -150,21 +159,19 @@ final class DisplayArranger {
     }
 
     // Make the virtual display main in the given mode, mirror the built-in
-    // screen to it (or guard it) and push the headset away
-    func arrange(virtual: VirtualDisplay, mode: DeskMode, headset: CGDirectDisplayID?) {
+    // screen to it (or guard it) and push the headset away. Asynchronous:
+    // WindowServer applies a configuration a moment after
+    // CGCompleteDisplayConfiguration returns, and a mode read back (or a new
+    // transaction started) before that sees the old state. So the layout
+    // goes first, then the mode in its own step, verified by polling
+    func arrange(virtual: VirtualDisplay, mode: DeskMode, completion: @escaping () -> Void) {
         let virtualID = virtual.displayID
         let builtIn = Self.onlineDisplays().first { CGDisplayIsBuiltin($0) != 0 && $0 != virtualID }
         let others = Self.onlineDisplays().filter { $0 != virtualID && $0 != builtIn }
 
-        guard let cgMode = virtual.cgMode(for: mode) else {
-            print("[displays] !!! mode \(mode.label) is not offered by the virtual display")
-            virtual.logAvailableModes()
-            return
-        }
-
         builtInPolicy = builtIn != nil ? .mirror : .guarded
+        farDisplays = others
         apply("arrange") { config in
-            CGConfigureDisplayWithDisplayMode(config, virtualID, cgMode, nil)
             CGConfigureDisplayOrigin(config, virtualID, 0, 0)
             if let builtIn {
                 CGConfigureDisplayMirrorOfDisplay(config, builtIn, virtualID)
@@ -172,27 +179,31 @@ final class DisplayArranger {
             self.pushAway(others, config: config, virtualMode: mode)
         }
 
-        // Mirroring tends to force a mode common to the whole mirror set
-        // (e.g. 16:10 for the built-in panel). Check, re-apply once, and if
-        // the wide mode still doesn't stick, give up mirroring
-        if !modeIsActive(mode, on: virtualID) {
-            print("[displays] mirroring changed the virtual display's mode — re-applying \(mode.label)")
-            apply("re-apply mode") { config in
-                CGConfigureDisplayWithDisplayMode(config, virtualID, cgMode, nil)
+        // Mirroring tends to force a mode common to the whole mirror set.
+        // If the wide mode doesn't stick, give up mirroring
+        setMode(mode, on: virtual) { [weak self] ok in
+            guard let self else { return }
+            if ok || builtIn == nil {
+                self.finishArrange(virtualID: virtualID, mode: mode, builtIn: builtIn)
+                completion()
+                return
             }
-        }
-        if let builtIn, !modeIsActive(mode, on: virtualID) {
-            print("[displays] !!! mirror keeps the wrong mode — switching the built-in display to guard")
-            builtInPolicy = .guarded
-            apply("guard built-in") { config in
-                CGConfigureDisplayMirrorOfDisplay(config, builtIn, kCGNullDirectDisplay)
-                CGConfigureDisplayWithDisplayMode(config, virtualID, cgMode, nil)
+            print("[displays] !!! mirroring keeps the wrong mode — switching the built-in display to guard")
+            self.builtInPolicy = .guarded
+            self.farDisplays = others + [builtIn!]
+            self.apply("guard built-in") { config in
+                CGConfigureDisplayMirrorOfDisplay(config, builtIn!, kCGNullDirectDisplay)
                 CGConfigureDisplayOrigin(config, virtualID, 0, 0)
-                self.pushAway(others + [builtIn], config: config, virtualMode: mode)
+                self.pushAway(self.farDisplays, config: config, virtualMode: mode)
+            }
+            self.setMode(mode, on: virtual) { _ in
+                self.finishArrange(virtualID: virtualID, mode: mode, builtIn: builtIn)
+                completion()
             }
         }
+    }
 
-        farDisplays = others + (builtInPolicy == .guarded ? [builtIn].compactMap { $0 } : [])
+    private func finishArrange(virtualID: CGDirectDisplayID, mode: DeskMode, builtIn: CGDirectDisplayID?) {
         print("[displays] built-in: \(builtIn == nil ? "none" : builtInPolicy.rawValue)")
         print("[displays] virtual mode: \(describeMode(of: virtualID))"
             + (modeIsActive(mode, on: virtualID) ? "" : " (!!! requested \(mode.label))"))
@@ -203,20 +214,52 @@ final class DisplayArranger {
         }
     }
 
-    // Mode switch while running (text size); the arrangement stays
-    func setMode(_ mode: DeskMode, on virtual: VirtualDisplay) -> Bool {
-        guard let cgMode = virtual.cgMode(for: mode) else {
-            print("[displays] !!! mode \(mode.label) is not offered")
-            return false
+    // Set the virtual display's mode and wait (up to ~1.5 s per attempt) for
+    // it to show up; up to 3 attempts. Also used for mode switches while
+    // running (text size); the arrangement stays
+    func setMode(_ mode: DeskMode, on virtual: VirtualDisplay, attempt: Int = 1,
+                 completion: @escaping (Bool) -> Void) {
+        let id = virtual.displayID
+        if modeIsActive(mode, on: id) {
+            completion(true)
+            return
         }
-        apply("mode \(mode.label)") { config in
-            CGConfigureDisplayWithDisplayMode(config, virtual.displayID, cgMode, nil)
-            // A size change moves neighbours around: keep the others away
-            self.pushAway(self.farDisplays, config: config, virtualMode: mode)
+        // Give the previous transaction a moment to land before the next one
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            if !virtual.setMode(mode) {
+                print("[displays] !!! CGVirtualDisplay rejected \(mode.label) (attempt \(attempt))")
+            }
+            self.poll(until: { self.modeIsActive(mode, on: id) }, timeout: 1.5) { ok in
+                if ok {
+                    print("[displays] mode → \(self.describeMode(of: id)) (attempt \(attempt))")
+                    // A size change moves the neighbours: keep the others away
+                    self.apply("keep displays away") { config in
+                        self.pushAway(self.farDisplays, config: config, virtualMode: mode)
+                    }
+                    completion(true)
+                } else if attempt < 3 {
+                    print("[displays] mode is still \(self.describeMode(of: id)) — retrying \(mode.label)")
+                    self.setMode(mode, on: virtual, attempt: attempt + 1, completion: completion)
+                } else {
+                    print("[displays] !!! mode stays \(self.describeMode(of: id)), wanted \(mode.label)")
+                    completion(false)
+                }
+            }
         }
-        let ok = modeIsActive(mode, on: virtual.displayID)
-        print("[displays] mode → \(describeMode(of: virtual.displayID))" + (ok ? "" : " (!!! wanted \(mode.label))"))
-        return ok
+    }
+
+    private func poll(until condition: @escaping () -> Bool, timeout: Double,
+                      started: Double = CACurrentMediaTime(), done: @escaping (Bool) -> Void) {
+        if condition() {
+            done(true)
+        } else if CACurrentMediaTime() - started > timeout {
+            done(false)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.poll(until: condition, timeout: timeout, started: started, done: done)
+            }
+        }
     }
 
     // Undo everything: un-mirror, original origins and modes. Runs before the
